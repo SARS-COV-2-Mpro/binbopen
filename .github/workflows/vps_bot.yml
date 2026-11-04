@@ -16,28 +16,35 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y openvpn
+          echo "--- OpenVPN Version ---"
+          openvpn --version
 
       - name: Setup VPN Credentials
         run: |
-          # Write credentials file
+          echo "--- Creating credentials file ---"
           echo "${{ secrets.VPN_USERNAME }}" > pass.txt
           echo "${{ secrets.VPN_PASSWORD }}" >> pass.txt
           chmod 600 pass.txt
+          echo "✅ pass.txt created"
 
-          # Write VPN config
+          echo "--- Writing VPN config ---"
           echo "${{ secrets.VPN_CONFIG }}" > config.ovpn
+          echo "✅ config.ovpn created"
 
-          # Remove deprecated options
+          echo "--- Removing deprecated options ---"
           sed -i '/persist-key/d' config.ovpn
           sed -i '/persist-tun/d' config.ovpn
+          echo "✅ Removed persist-key and persist-tun"
 
-          # Fix auth-user-pass line
+          echo "--- Fixing auth-user-pass line ---"
           sed -i '/auth-user-pass/d' config.ovpn
           echo "auth-user-pass pass.txt" >> config.ovpn
+          echo "✅ auth-user-pass fixed"
 
-          # Verify the final config
-          echo "--- Final config.ovpn ---"
+          echo "==============================="
+          echo "--- Final config.ovpn content ---"
           cat config.ovpn
+          echo "==============================="
 
       - name: Check IP Before VPN
         run: |
@@ -49,77 +56,118 @@ jobs:
 
       - name: Start VPN
         run: |
-          # Enable TUN device
+          echo "--- Enabling TUN device ---"
           sudo modprobe tun
           ls /dev/net/tun
+          echo "✅ TUN device is available"
 
-          # Start OpenVPN in background
+          echo "--- Creating log file with open permissions ---"
+          sudo touch /tmp/vpn.log
+          sudo chmod 777 /tmp/vpn.log
+          echo "✅ Log file created"
+
+          echo "--- Starting OpenVPN ---"
           sudo openvpn \
             --config config.ovpn \
             --auth-user-pass pass.txt \
             --daemon \
             --log /tmp/vpn.log
+          echo "✅ OpenVPN daemon started"
 
-          # Wait for connection to establish
-          echo "Waiting for VPN to connect..."
+          echo "--- Waiting 15 seconds for connection ---"
           sleep 15
 
-          # Show VPN log
+          echo "==============================="
           echo "--- VPN Log ---"
-          cat /tmp/vpn.log
-          echo ""
+          sudo cat /tmp/vpn.log
+          echo "==============================="
+
+          echo "--- Checking if OpenVPN process is running ---"
+          if pgrep openvpn > /dev/null; then
+            echo "✅ OpenVPN process is RUNNING"
+          else
+            echo "❌ OpenVPN process is NOT running"
+            exit 1
+          fi
 
       - name: Verify VPN Connection
         run: |
           echo "==============================="
           echo "Exit IP (After VPN):"
-          curl -s https://ifconfig.me
+          CURRENT_IP=$(curl -s https://ifconfig.me)
+          echo "$CURRENT_IP"
           echo ""
-          echo "==============================="
 
+          echo "==============================="
           echo "Location Details:"
-          curl -s https://ipinfo.io/$(curl -s https://ifconfig.me)
+          curl -s https://ipinfo.io/$CURRENT_IP
           echo ""
-          echo "==============================="
 
-          echo "VPN Tunnel Interface:"
-          ip addr show tun0
-          echo ""
           echo "==============================="
+          echo "VPN Tunnel Interface (tun0):"
+          if ip addr show tun0 > /dev/null 2>&1; then
+            ip addr show tun0
+            echo "✅ tun0 is UP"
+          else
+            echo "❌ tun0 is NOT found"
+            exit 1
+          fi
 
+          echo "==============================="
           echo "Routing Table:"
           ip route
           echo ""
+
+          echo "==============================="
+          echo "DNS Check:"
+          cat /etc/resolv.conf
+          echo ""
+
+          echo "==============================="
+          echo "--- Full VPN Log After Connection ---"
+          sudo cat /tmp/vpn.log
           echo "==============================="
 
       - name: Run Task and Ping Pong Loop
         run: |
-          echo "VPN is active. Running for 5 hours and 50 minutes..."
+          echo "==============================="
+          echo "✅ VPN is ACTIVE"
+          echo "⏱ Running for 5 hours and 50 minutes..."
+          echo "==============================="
 
           # --- ADD YOUR TASK HERE ---
           # Example: python3 bot.py &
           # --------------------------
 
-          # Background loop - checks connection every minute
           (
             for i in {1..350}; do
-              echo "Minute $i/350 - Current IP: $(curl -s https://ifconfig.me)"
+              CURRENT_IP=$(curl -s https://ifconfig.me)
+
+              if pgrep openvpn > /dev/null; then
+                echo "✅ Minute $i/350 | VPN: ACTIVE | IP: $CURRENT_IP"
+              else
+                echo "❌ Minute $i/350 | VPN: DEAD | IP: $CURRENT_IP"
+                echo "--- VPN Log at time of failure ---"
+                sudo cat /tmp/vpn.log
+                exit 1
+              fi
+
               sleep 60
             done
 
             echo "==============================="
-            echo "5h 50min reached. Triggering next job..."
+            echo "⏱ 5h 50min reached."
+            echo "🔄 Triggering next job (Ping Pong)..."
             echo "==============================="
 
-            # Trigger the next job (Ping Pong)
             curl -X POST \
               -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/${{ github.repository }}/dispatches \
               -d '{"event_type": "restart_vpn"}'
 
-            echo "Next job triggered successfully ✅"
+            echo "✅ Next job triggered successfully!"
+            echo "🏓 Ping Pong cycle complete."
           ) &
 
-          # Wait for background loop to finish
           wait
