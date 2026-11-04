@@ -1,0 +1,62 @@
+name: Continuous VPN Worker
+
+on:
+  workflow_dispatch: # Allows you to start it manually
+  repository_dispatch:
+    types: [restart_vpn]
+
+jobs:
+  run-vpn-task:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install OpenVPN
+        run: sudo apt-get update && sudo apt-get install -y openvpn
+
+      - name: Setup VPN Credentials
+        run: |
+          echo "${{ secrets.VPN_CONFIG }}" > config.ovpn
+          echo "${{ secrets.VPN_USERNAME }}" > pass.txt
+          echo "${{ secrets.VPN_PASSWORD }}" >> pass.txt
+          # Update config to use the password file automatically
+          sed -i 's/auth-user-pass/auth-user-pass pass.txt/' config.ovpn
+
+      - name: Start VPN
+        run: |
+          # Start OpenVPN in the background
+          sudo openvpn --config config.ovpn --daemon
+          # Wait a few seconds for connection to establish
+          sleep 15
+          # Verify IP (Should show your VPN IP, not GitHub's)
+          echo "Current Public IP:"
+          curl -s https://ifconfig.me
+          echo ""
+
+      - name: Run Your Task (The Ping Pong Loop)
+        run: |
+          echo "VPN is active. Running task for 5 hours and 50 minutes..."
+          
+          # --- START YOUR ACTUAL TASK HERE ---
+          # Example: python bot.py & 
+          # Or just a loop to keep the connection alive:
+          
+          # This background loop checks the connection every minute
+          (
+            for i in {1..350}; do
+              echo "Time elapsed: $i minutes. IP is $(curl -s ifconfig.me)"
+              sleep 60
+            done
+            
+            # AT 5:50 (350 minutes), trigger the next job
+            echo "Time limit approaching. Triggering next job..."
+            curl -X POST \
+              -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{"event_type": "restart_vpn"}'
+          ) &
+          
+          # Wait for the background loop to finish before the job ends
+          wait
