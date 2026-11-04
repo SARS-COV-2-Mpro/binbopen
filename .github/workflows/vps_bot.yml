@@ -156,24 +156,47 @@ jobs:
       - name: Start Receiver
         run: |
           echo "==============================="
-          echo "--- Starting receiver.py on port 8081 ---"
-          nohup python3 receiver.py > /tmp/receiver.log 2>&1 &
+          echo "--- Checking python3 availability ---"
+          python3 --version
+          echo "==============================="
+
+          echo "--- Starting receiver.py (unbuffered) on port 8081 ---"
+          nohup python3 -u receiver.py > /tmp/receiver.log 2>&1 &
           RECEIVER_PID=$!
           echo "✅ Receiver PID: $RECEIVER_PID"
 
-          sleep 3
+          sleep 5
 
-          echo "--- Receiver Log ---"
+          echo "--- Checking if port 8081 is listening ---"
+          sudo ss -tlnp | grep 8081 || echo "⚠️ Port 8081 not found in ss output"
+
+          echo "--- Receiver Log (first 5 seconds) ---"
           cat /tmp/receiver.log
           echo "==============================="
 
-          echo "--- Checking receiver is listening on 8081 ---"
-          if curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ | grep -q "503\|200\|404"; then
-            echo "✅ Receiver is responding on port 8081"
-          else
-            echo "❌ Receiver did NOT start correctly"
+          echo "--- Checking receiver process is alive ---"
+          if ! pgrep -f receiver.py > /dev/null; then
+            echo "❌ receiver.py process is NOT running"
             cat /tmp/receiver.log
             exit 1
+          fi
+          echo "✅ receiver.py process is alive"
+
+          echo "--- Testing receiver with curl (verbose) ---"
+          HTTP_CODE=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" http://localhost:8081/ --max-time 10)
+          echo "HTTP response code: $HTTP_CODE"
+          echo "--- Response body ---"
+          cat /tmp/curl_response.txt
+          echo ""
+          echo "==============================="
+
+          if [ "$HTTP_CODE" == "000" ]; then
+            echo "❌ Receiver is NOT reachable at all (connection failed)"
+            echo "--- Full Receiver Log ---"
+            cat /tmp/receiver.log
+            exit 1
+          else
+            echo "✅ Receiver responded with HTTP $HTTP_CODE (server is up)"
           fi
 
       - name: Start Ngrok Tunnel
