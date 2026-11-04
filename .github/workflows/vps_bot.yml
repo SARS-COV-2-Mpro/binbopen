@@ -153,27 +153,114 @@ jobs:
           sudo cat /tmp/vpn.log
           echo "==============================="
 
+      - name: Start Receiver
+        run: |
+          echo "==============================="
+          echo "--- Starting receiver.py on port 8081 ---"
+          nohup python3 receiver.py > /tmp/receiver.log 2>&1 &
+          RECEIVER_PID=$!
+          echo "✅ Receiver PID: $RECEIVER_PID"
+
+          sleep 3
+
+          echo "--- Receiver Log ---"
+          cat /tmp/receiver.log
+          echo "==============================="
+
+          echo "--- Checking receiver is listening on 8081 ---"
+          if curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ | grep -q "503\|200\|404"; then
+            echo "✅ Receiver is responding on port 8081"
+          else
+            echo "❌ Receiver did NOT start correctly"
+            cat /tmp/receiver.log
+            exit 1
+          fi
+
+      - name: Start Ngrok Tunnel
+        run: |
+          echo "==============================="
+          echo "--- Installing ngrok ---"
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update
+          sudo apt install -y ngrok
+          echo "✅ ngrok installed"
+
+          echo "--- Configuring ngrok authtoken ---"
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+          echo "✅ authtoken configured"
+
+          echo "--- Starting ngrok tunnel on static dev domain ---"
+          nohup ngrok http 8081 --domain=${{ secrets.NGROK_DOMAIN }} > /tmp/ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "✅ ngrok PID: $NGROK_PID"
+
+          sleep 8
+
+          echo "--- Ngrok Log ---"
+          cat /tmp/ngrok.log
+          echo "==============================="
+
+          echo "--- Ngrok Tunnel Status (API) ---"
+          curl -s http://localhost:4040/api/tunnels
+          echo ""
+          echo "==============================="
+
+          echo "✅ Your Binance Receiver URL: https://${{ secrets.NGROK_DOMAIN }}"
+          echo "==============================="
+
+          echo "--- Verifying public URL responds ---"
+          PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://${{ secrets.NGROK_DOMAIN }}/)
+          echo "Public URL responded with status: $PUBLIC_STATUS"
+          if [ "$PUBLIC_STATUS" == "000" ]; then
+            echo "❌ Ngrok tunnel is NOT reachable publicly"
+            cat /tmp/ngrok.log
+            exit 1
+          else
+            echo "✅ Ngrok tunnel is publicly reachable"
+          fi
+
       - name: Run Task and Ping Pong Loop
         run: |
           echo "==============================="
           echo "✅ VPN is ACTIVE"
+          echo "✅ Receiver is ACTIVE on port 8081"
+          echo "✅ Ngrok tunnel is ACTIVE at https://${{ secrets.NGROK_DOMAIN }}"
           echo "⏱ Running for 5 hours and 50 minutes..."
           echo "==============================="
-
-          # --- ADD YOUR TASK HERE ---
-          # Example: python3 bot.py &
-          # --------------------------
 
           (
             for i in {1..350}; do
               CURRENT_IP=$(curl -s https://ifconfig.me)
 
               if pgrep openvpn > /dev/null; then
-                echo "✅ Minute $i/350 | VPN: ACTIVE | IP: $CURRENT_IP"
+                VPN_STATUS="ACTIVE"
               else
-                echo "❌ Minute $i/350 | VPN: DEAD | IP: $CURRENT_IP"
-                echo "--- VPN Log at time of failure ---"
+                VPN_STATUS="DEAD"
+              fi
+
+              if pgrep -f receiver.py > /dev/null; then
+                RECEIVER_STATUS="ACTIVE"
+              else
+                RECEIVER_STATUS="DEAD"
+              fi
+
+              if pgrep ngrok > /dev/null; then
+                NGROK_STATUS="ACTIVE"
+              else
+                NGROK_STATUS="DEAD"
+              fi
+
+              echo "✅ Minute $i/350 | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
+
+              if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$NGROK_STATUS" == "DEAD" ]; then
+                echo "❌ Something died. Dumping logs..."
+                echo "--- VPN Log ---"
                 sudo cat /tmp/vpn.log
+                echo "--- Receiver Log ---"
+                cat /tmp/receiver.log
+                echo "--- Ngrok Log ---"
+                cat /tmp/ngrok.log
                 exit 1
               fi
 
