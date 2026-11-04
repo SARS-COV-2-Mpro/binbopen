@@ -41,6 +41,11 @@ jobs:
           echo "auth-user-pass pass.txt" >> config.ovpn
           echo "✅ auth-user-pass fixed"
 
+          echo "--- Fixing cipher negotiation (OpenVPN 2.6+ requirement) ---"
+          echo "data-ciphers AES-128-CBC" >> config.ovpn
+          echo "data-ciphers-fallback AES-128-CBC" >> config.ovpn
+          echo "✅ data-ciphers added"
+
           echo "==============================="
           echo "--- Final config.ovpn content ---"
           cat config.ovpn
@@ -76,8 +81,8 @@ jobs:
           VPN_PID=$!
           echo "✅ OpenVPN PID: $VPN_PID"
 
-          echo "--- Waiting up to 30 seconds for tun0 to appear ---"
-          for i in {1..30}; do
+          echo "--- Waiting up to 60 seconds for tun0 to appear ---"
+          for i in {1..60}; do
             sleep 1
             if ip link show tun0 > /dev/null 2>&1; then
               echo "✅ tun0 appeared at second $i"
