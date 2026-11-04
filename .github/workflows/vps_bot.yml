@@ -1,7 +1,7 @@
 name: Continuous VPN Worker
 
 on:
-  workflow_dispatch: # Allows you to start it manually
+  workflow_dispatch:
   repository_dispatch:
     types: [restart_vpn]
 
@@ -13,50 +13,113 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install OpenVPN
-        run: sudo apt-get update && sudo apt-get install -y openvpn
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn
 
       - name: Setup VPN Credentials
         run: |
-          echo "${{ secrets.VPN_CONFIG }}" > config.ovpn
+          # Write credentials file
           echo "${{ secrets.VPN_USERNAME }}" > pass.txt
           echo "${{ secrets.VPN_PASSWORD }}" >> pass.txt
-          # Update config to use the password file automatically
-          sed -i 's/auth-user-pass/auth-user-pass pass.txt/' config.ovpn
+          chmod 600 pass.txt
+
+          # Write VPN config
+          echo "${{ secrets.VPN_CONFIG }}" > config.ovpn
+
+          # Remove deprecated options
+          sed -i '/persist-key/d' config.ovpn
+          sed -i '/persist-tun/d' config.ovpn
+
+          # Fix auth-user-pass line
+          sed -i '/auth-user-pass/d' config.ovpn
+          echo "auth-user-pass pass.txt" >> config.ovpn
+
+          # Verify the final config
+          echo "--- Final config.ovpn ---"
+          cat config.ovpn
+
+      - name: Check IP Before VPN
+        run: |
+          echo "==============================="
+          echo "GitHub Runner IP (Before VPN):"
+          curl -s https://ifconfig.me
+          echo ""
+          echo "==============================="
 
       - name: Start VPN
         run: |
-          # Start OpenVPN in the background
-          sudo openvpn --config config.ovpn --daemon
-          # Wait a few seconds for connection to establish
+          # Enable TUN device
+          sudo modprobe tun
+          ls /dev/net/tun
+
+          # Start OpenVPN in background
+          sudo openvpn \
+            --config config.ovpn \
+            --auth-user-pass pass.txt \
+            --daemon \
+            --log /tmp/vpn.log
+
+          # Wait for connection to establish
+          echo "Waiting for VPN to connect..."
           sleep 15
-          # Verify IP (Should show your VPN IP, not GitHub's)
-          echo "Current Public IP:"
-          curl -s https://ifconfig.me
+
+          # Show VPN log
+          echo "--- VPN Log ---"
+          cat /tmp/vpn.log
           echo ""
 
-      - name: Run Your Task (The Ping Pong Loop)
+      - name: Verify VPN Connection
         run: |
-          echo "VPN is active. Running task for 5 hours and 50 minutes..."
-          
-          # --- START YOUR ACTUAL TASK HERE ---
-          # Example: python bot.py & 
-          # Or just a loop to keep the connection alive:
-          
-          # This background loop checks the connection every minute
+          echo "==============================="
+          echo "Exit IP (After VPN):"
+          curl -s https://ifconfig.me
+          echo ""
+          echo "==============================="
+
+          echo "Location Details:"
+          curl -s https://ipinfo.io/$(curl -s https://ifconfig.me)
+          echo ""
+          echo "==============================="
+
+          echo "VPN Tunnel Interface:"
+          ip addr show tun0
+          echo ""
+          echo "==============================="
+
+          echo "Routing Table:"
+          ip route
+          echo ""
+          echo "==============================="
+
+      - name: Run Task and Ping Pong Loop
+        run: |
+          echo "VPN is active. Running for 5 hours and 50 minutes..."
+
+          # --- ADD YOUR TASK HERE ---
+          # Example: python3 bot.py &
+          # --------------------------
+
+          # Background loop - checks connection every minute
           (
             for i in {1..350}; do
-              echo "Time elapsed: $i minutes. IP is $(curl -s ifconfig.me)"
+              echo "Minute $i/350 - Current IP: $(curl -s https://ifconfig.me)"
               sleep 60
             done
-            
-            # AT 5:50 (350 minutes), trigger the next job
-            echo "Time limit approaching. Triggering next job..."
+
+            echo "==============================="
+            echo "5h 50min reached. Triggering next job..."
+            echo "==============================="
+
+            # Trigger the next job (Ping Pong)
             curl -X POST \
               -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/${{ github.repository }}/dispatches \
               -d '{"event_type": "restart_vpn"}'
+
+            echo "Next job triggered successfully ✅"
           ) &
-          
-          # Wait for the background loop to finish before the job ends
+
+          # Wait for background loop to finish
           wait
