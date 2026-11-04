@@ -66,27 +66,47 @@ jobs:
           sudo chmod 777 /tmp/vpn.log
           echo "✅ Log file created"
 
-          echo "--- Starting OpenVPN ---"
+          echo "--- Starting OpenVPN in FOREGROUND to see full output ---"
           sudo openvpn \
             --config config.ovpn \
             --auth-user-pass pass.txt \
-            --daemon \
-            --log /tmp/vpn.log
-          echo "✅ OpenVPN daemon started"
+            --verb 6 \
+            --log /tmp/vpn.log &
 
-          echo "--- Waiting 15 seconds for connection ---"
-          sleep 15
+          VPN_PID=$!
+          echo "✅ OpenVPN PID: $VPN_PID"
+
+          echo "--- Waiting up to 30 seconds for tun0 to appear ---"
+          for i in {1..30}; do
+            sleep 1
+            if ip link show tun0 > /dev/null 2>&1; then
+              echo "✅ tun0 appeared at second $i"
+              break
+            fi
+            echo "⏳ Second $i - waiting for tun0..."
+          done
 
           echo "==============================="
-          echo "--- VPN Log ---"
+          echo "--- Full VPN Log ---"
           sudo cat /tmp/vpn.log
           echo "==============================="
 
-          echo "--- Checking if OpenVPN process is running ---"
+          echo "--- Checking tun0 ---"
+          if ip link show tun0 > /dev/null 2>&1; then
+            echo "✅ tun0 is UP"
+          else
+            echo "❌ tun0 NEVER appeared - VPN failed to connect"
+            echo "--- OpenVPN Process Status ---"
+            ps aux | grep openvpn
+            echo "--- Check log above for AUTH_FAILED or TLS errors ---"
+            exit 1
+          fi
+
+          echo "--- Checking OpenVPN process ---"
           if pgrep openvpn > /dev/null; then
             echo "✅ OpenVPN process is RUNNING"
           else
-            echo "❌ OpenVPN process is NOT running"
+            echo "❌ OpenVPN process DIED"
             exit 1
           fi
 
