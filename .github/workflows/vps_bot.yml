@@ -55,7 +55,7 @@ jobs:
         run: |
           echo "==============================="
           echo "GitHub Runner IP (Before VPN):"
-          curl -s https://ifconfig.me
+          curl -s --max-time 10 https://ifconfig.me || echo "⚠️ ifconfig.me unreachable (non-fatal)"
           echo ""
           echo "==============================="
 
@@ -117,13 +117,17 @@ jobs:
         run: |
           echo "==============================="
           echo "Exit IP (After VPN):"
-          CURRENT_IP=$(curl -s https://ifconfig.me)
+          CURRENT_IP=$(curl -s --max-time 10 https://ifconfig.me || echo "UNKNOWN")
           echo "$CURRENT_IP"
           echo ""
 
           echo "==============================="
           echo "Location Details:"
-          curl -s https://ipinfo.io/$CURRENT_IP
+          if [ "$CURRENT_IP" != "UNKNOWN" ]; then
+            curl -s --max-time 10 https://ipinfo.io/$CURRENT_IP || echo "⚠️ ipinfo.io unreachable (non-fatal)"
+          else
+            echo "⚠️ Skipping ipinfo.io lookup — IP unknown"
+          fi
           echo ""
 
           echo "==============================="
@@ -181,10 +185,10 @@ jobs:
           echo "✅ receiver.py process is alive"
 
           echo "--- Testing receiver with curl ---"
-          HTTP_CODE=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" http://localhost:8081/ --max-time 10)
+          HTTP_CODE=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" --max-time 10 http://localhost:8081/ || echo "000")
           echo "HTTP response code: $HTTP_CODE"
           echo "--- Response body ---"
-          cat /tmp/curl_response.txt
+          cat /tmp/curl_response.txt 2>/dev/null || echo "(no response body captured)"
           echo ""
           echo "==============================="
 
@@ -222,7 +226,7 @@ jobs:
           echo "==============================="
 
           echo "--- Ngrok Tunnel Status (API) ---"
-          curl -s http://localhost:4040/api/tunnels
+          curl -s --max-time 10 http://localhost:4040/api/tunnels || echo "⚠️ Could not reach ngrok local API (non-fatal)"
           echo ""
           echo "==============================="
 
@@ -230,7 +234,7 @@ jobs:
           echo "==============================="
 
           echo "--- Verifying public URL responds ---"
-          PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://${{ secrets.NGROK_DOMAIN }}/)
+          PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://${{ secrets.NGROK_DOMAIN }}/ || echo "000")
           echo "Public URL responded with status: $PUBLIC_STATUS"
           if [ "$PUBLIC_STATUS" == "000" ]; then
             echo "❌ Ngrok tunnel is NOT reachable publicly"
@@ -252,20 +256,20 @@ jobs:
           trigger_relay() {
             echo "==============================="
             echo "🔄 Triggering Relay workflow (relay_ping)..."
-            curl -X POST \
+            curl -s -X POST --max-time 15 \
               -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/${{ github.repository }}/dispatches \
-              -d '{"event_type": "relay_ping"}'
+              -d '{"event_type": "relay_ping"}' || echo "⚠️ Relay trigger request failed (non-fatal, see below)"
             echo ""
-            echo "✅ Relay workflow triggered!"
+            echo "✅ Relay workflow trigger attempted!"
             echo "==============================="
           }
 
           FAILURE=0
 
           for i in {1..240}; do
-            CURRENT_IP=$(curl -s https://ifconfig.me)
+            CURRENT_IP=$(curl -s --max-time 10 https://ifconfig.me || echo "UNKNOWN")
 
             if pgrep openvpn > /dev/null; then
               VPN_STATUS="ACTIVE"
