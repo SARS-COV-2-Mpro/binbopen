@@ -262,51 +262,59 @@ jobs:
             echo "==============================="
           }
 
-          (
-            for i in {1..240}; do
-              CURRENT_IP=$(curl -s https://ifconfig.me)
+          FAILURE=0
 
-              if pgrep openvpn > /dev/null; then
-                VPN_STATUS="ACTIVE"
-              else
-                VPN_STATUS="DEAD"
-              fi
+          for i in {1..240}; do
+            CURRENT_IP=$(curl -s https://ifconfig.me)
 
-              if pgrep -f receiver.py > /dev/null; then
-                RECEIVER_STATUS="ACTIVE"
-              else
-                RECEIVER_STATUS="DEAD"
-              fi
+            if pgrep openvpn > /dev/null; then
+              VPN_STATUS="ACTIVE"
+            else
+              VPN_STATUS="DEAD"
+            fi
 
-              if pgrep ngrok > /dev/null; then
-                NGROK_STATUS="ACTIVE"
-              else
-                NGROK_STATUS="DEAD"
-              fi
+            if pgrep -f receiver.py > /dev/null; then
+              RECEIVER_STATUS="ACTIVE"
+            else
+              RECEIVER_STATUS="DEAD"
+            fi
 
-              echo "✅ Minute $i/240 | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
+            if pgrep ngrok > /dev/null; then
+              NGROK_STATUS="ACTIVE"
+            else
+              NGROK_STATUS="DEAD"
+            fi
 
-              if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$NGROK_STATUS" == "DEAD" ]; then
-                echo "❌ Something died at minute $i. Dumping logs..."
-                echo "--- VPN Log ---"
-                sudo cat /tmp/vpn.log
-                echo "--- Receiver Log ---"
-                cat /tmp/receiver.log
-                echo "--- Ngrok Log ---"
-                cat /tmp/ngrok.log
-                echo "🔄 Triggering emergency relay before exiting to keep chain alive..."
-                trigger_relay
-                exit 1
-              fi
+            echo "✅ Minute $i/240 | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
 
-              sleep 60
-            done
+            if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$NGROK_STATUS" == "DEAD" ]; then
+              echo "❌ Something died at minute $i. Dumping logs..."
+              echo "--- VPN Log ---"
+              sudo cat /tmp/vpn.log
+              echo "--- Receiver Log ---"
+              cat /tmp/receiver.log
+              echo "--- Ngrok Log ---"
+              cat /tmp/ngrok.log
+              echo "🔄 Triggering emergency relay before exiting to keep chain alive..."
+              trigger_relay
+              FAILURE=1
+              break
+            fi
 
+            sleep 60
+          done
+
+          if [ "$FAILURE" == "1" ]; then
+            echo "==============================="
+            echo "❌ Workflow A exiting with FAILURE status (component died early at minute $i)"
+            echo "✅ Chain preserved — Relay workflow was already triggered before exit"
+            echo "==============================="
+            exit 1
+          else
             echo "==============================="
             echo "⏱ 240 minutes reached — normal handoff."
             echo "==============================="
             trigger_relay
             echo "🏓 Workflow A complete — Workflow B now running."
-          ) &
-
-          wait
+            echo "==============================="
+          fi
