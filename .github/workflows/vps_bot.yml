@@ -71,7 +71,7 @@ jobs:
           sudo chmod 777 /tmp/vpn.log
           echo "✅ Log file created"
 
-          echo "--- Starting OpenVPN in FOREGROUND to see full output ---"
+          echo "--- Starting OpenVPN ---"
           sudo openvpn \
             --config config.ovpn \
             --auth-user-pass pass.txt \
@@ -101,9 +101,7 @@ jobs:
             echo "✅ tun0 is UP"
           else
             echo "❌ tun0 NEVER appeared - VPN failed to connect"
-            echo "--- OpenVPN Process Status ---"
             ps aux | grep openvpn
-            echo "--- Check log above for AUTH_FAILED or TLS errors ---"
             exit 1
           fi
 
@@ -182,7 +180,7 @@ jobs:
           fi
           echo "✅ receiver.py process is alive"
 
-          echo "--- Testing receiver with curl (verbose) ---"
+          echo "--- Testing receiver with curl ---"
           HTTP_CODE=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" http://localhost:8081/ --max-time 10)
           echo "HTTP response code: $HTTP_CODE"
           echo "--- Response body ---"
@@ -192,7 +190,6 @@ jobs:
 
           if [ "$HTTP_CODE" == "000" ]; then
             echo "❌ Receiver is NOT reachable at all (connection failed)"
-            echo "--- Full Receiver Log ---"
             cat /tmp/receiver.log
             exit 1
           else
@@ -213,8 +210,8 @@ jobs:
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
           echo "✅ authtoken configured"
 
-          echo "--- Starting ngrok tunnel on static dev domain ---"
-          nohup ngrok http 8081 --domain=${{ secrets.NGROK_DOMAIN }} > /tmp/ngrok.log 2>&1 &
+          echo "--- Starting ngrok tunnel on static domain ---"
+          nohup ngrok http 8081 --url=${{ secrets.NGROK_DOMAIN }} > /tmp/ngrok.log 2>&1 &
           NGROK_PID=$!
           echo "✅ ngrok PID: $NGROK_PID"
 
@@ -229,7 +226,7 @@ jobs:
           echo ""
           echo "==============================="
 
-          echo "✅ Your Binance Receiver URL: https://${{ secrets.NGROK_DOMAIN }}"
+          echo "✅ Binance Receiver URL: https://${{ secrets.NGROK_DOMAIN }}"
           echo "==============================="
 
           echo "--- Verifying public URL responds ---"
@@ -249,11 +246,24 @@ jobs:
           echo "✅ VPN is ACTIVE"
           echo "✅ Receiver is ACTIVE on port 8081"
           echo "✅ Ngrok tunnel is ACTIVE at https://${{ secrets.NGROK_DOMAIN }}"
-          echo "⏱ Running for 5 hours and 50 minutes..."
+          echo "⏱ Running for 240 minutes then handing off to Relay workflow..."
           echo "==============================="
 
+          trigger_relay() {
+            echo "==============================="
+            echo "🔄 Triggering Relay workflow (relay_ping)..."
+            curl -X POST \
+              -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{"event_type": "relay_ping"}'
+            echo ""
+            echo "✅ Relay workflow triggered!"
+            echo "==============================="
+          }
+
           (
-            for i in {1..350}; do
+            for i in {1..240}; do
               CURRENT_IP=$(curl -s https://ifconfig.me)
 
               if pgrep openvpn > /dev/null; then
@@ -274,16 +284,18 @@ jobs:
                 NGROK_STATUS="DEAD"
               fi
 
-              echo "✅ Minute $i/350 | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
+              echo "✅ Minute $i/240 | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
 
               if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$NGROK_STATUS" == "DEAD" ]; then
-                echo "❌ Something died. Dumping logs..."
+                echo "❌ Something died at minute $i. Dumping logs..."
                 echo "--- VPN Log ---"
                 sudo cat /tmp/vpn.log
                 echo "--- Receiver Log ---"
                 cat /tmp/receiver.log
                 echo "--- Ngrok Log ---"
                 cat /tmp/ngrok.log
+                echo "🔄 Triggering emergency relay before exiting to keep chain alive..."
+                trigger_relay
                 exit 1
               fi
 
@@ -291,18 +303,10 @@ jobs:
             done
 
             echo "==============================="
-            echo "⏱ 5h 50min reached."
-            echo "🔄 Triggering next job (Ping Pong)..."
+            echo "⏱ 240 minutes reached — normal handoff."
             echo "==============================="
-
-            curl -X POST \
-              -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/dispatches \
-              -d '{"event_type": "restart_vpn"}'
-
-            echo "✅ Next job triggered successfully!"
-            echo "🏓 Ping Pong cycle complete."
+            trigger_relay
+            echo "🏓 Workflow A complete — Workflow B now running."
           ) &
 
           wait
