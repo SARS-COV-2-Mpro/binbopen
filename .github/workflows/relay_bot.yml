@@ -1,0 +1,41 @@
+name: Relay Bridge (Ping Pong B)
+
+on:
+  repository_dispatch:
+    types: [relay_ping]
+
+jobs:
+  relay-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bridge Start
+        run: |
+          echo "==============================="
+          echo "🏓 Relay Bridge (Workflow B) started"
+          echo "⏱ Waiting 3 minutes before triggering Workflow A..."
+          echo "==============================="
+
+      - name: Wait 3 Minutes
+        run: |
+          for i in {1..3}; do
+            echo "⏳ Relay minute $i/3 — standing by..."
+            sleep 60
+          done
+          echo "✅ 3 minute relay wait complete"
+
+      - name: Trigger Workflow A
+        run: |
+          echo "==============================="
+          echo "🔄 Triggering Workflow A (restart_vpn)..."
+          echo "==============================="
+
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type": "restart_vpn"}'
+
+          echo ""
+          echo "✅ Workflow A triggered successfully!"
+          echo "🏓 Ping Pong cycle complete — Workflow A is now starting."
+          echo "==============================="
