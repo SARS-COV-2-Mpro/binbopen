@@ -12,16 +12,16 @@ jobs:
         run: |
           echo "==============================="
           echo "🏓 Relay Bridge (Workflow B) started"
-          echo "⏱ Waiting 3 minutes before triggering Workflow A..."
+          echo "⏱ Waiting 1 minute before triggering Workflow A..."
           echo "==============================="
 
-      - name: Wait 3 Minutes
+      - name: Wait 1 Minute
         run: |
-          for i in {1..3}; do
-            echo "⏳ Relay minute $i/3 — standing by..."
+          for i in {1..1}; do
+            echo "⏳ Relay minute $i/1 — standing by..."
             sleep 60
           done
-          echo "✅ 3 minute relay wait complete"
+          echo "✅ 1 minute relay wait complete"
 
       - name: Trigger Workflow A
         run: |
