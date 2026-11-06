@@ -320,48 +320,95 @@ jobs:
           set -Eeuo pipefail
           trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Start Ngrok Tunnel"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
 
-          echo "==============================="
-          echo "--- Attempt 1: Downloading ngrok binary from official bin.ngrok.com mirror ---"
-          DOWNLOAD_OK=0
-          if curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
-            https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o /tmp/ngrok.tgz; then
-            SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
-            if [ "$SIZE" -gt 1000000 ]; then
-              echo "✅ Downloaded successfully from bin.ngrok.com (${SIZE} bytes)"
-              DOWNLOAD_OK=1
-            else
-              echo "⚠️ File downloaded but suspiciously small (${SIZE} bytes) — treating as failed"
-            fi
-          else
-            echo "⚠️ bin.ngrok.com download failed or timed out"
-          fi
+          NGROK_READY=0
 
-          if [ "$DOWNLOAD_OK" -eq 0 ]; then
-            echo "==============================="
-            echo "--- Attempt 2: Fallback — installing ngrok via apt repository ---"
-            if curl -sSL --connect-timeout 15 --max-time 30 https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null; then
-              echo "✅ ngrok GPG key added"
-              echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null
-              if sudo apt-get update && sudo apt-get install -y ngrok; then
-                echo "✅ ngrok installed via apt fallback"
-                DOWNLOAD_OK=1
+          echo "==============================="
+          echo "--- Attempt 1: Installing ngrok via apt repository (small chunked fetch, more reliable than one big CDN file) ---"
+          set +e
+          curl -sSL --connect-timeout 15 --max-time 30 https://ngrok-agent.s3.amazonaws.com/ngrok.asc 2>/tmp/apt_key_err.log | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          KEY_EXIT=$?
+          set -e
+
+          if [ $KEY_EXIT -eq 0 ] && [ -s /etc/apt/trusted.gpg.d/ngrok.asc ]; then
+            echo "✅ ngrok GPG key added"
+            echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null
+
+            set +e
+            sudo apt-get update
+            UPDATE_EXIT=$?
+            set -e
+
+            if [ $UPDATE_EXIT -eq 0 ]; then
+              set +e
+              sudo apt-get install -y ngrok
+              INSTALL_EXIT=$?
+              set -e
+              if [ $INSTALL_EXIT -eq 0 ] && command -v ngrok > /dev/null 2>&1; then
+                echo "✅ ngrok installed via apt"
+                NGROK_READY=1
               else
-                echo "❌ apt-based ngrok install also failed"
+                echo "⚠️ apt-get install ngrok failed (exit $INSTALL_EXIT) — will try direct binary download"
               fi
             else
-              echo "❌ Could not fetch ngrok GPG key for apt fallback"
+              echo "⚠️ apt-get update failed after adding ngrok repo (exit $UPDATE_EXIT) — will try direct binary download"
             fi
           else
-            echo "--- Extracting ngrok binary to /usr/local/bin ---"
-            if ! sudo tar -xzf /tmp/ngrok.tgz -C /usr/local/bin; then
-              echo "❌ Failed to extract ngrok binary"
-              exit 1
-            fi
-            echo "✅ ngrok binary extracted"
+            echo "⚠️ Failed to fetch ngrok GPG key (curl exit $KEY_EXIT) — skipping apt method, trying direct binary download"
           fi
 
-          if [ "$DOWNLOAD_OK" -eq 0 ]; then
-            echo "❌ Both download methods failed — cannot proceed"
+          if [ "$NGROK_READY" -eq 0 ]; then
+            echo "==============================="
+            echo "--- Attempt 2: Fallback — direct binary download with RESUME + multiple short retries ---"
+            echo "--- (fixes stalled-transfer problem: each retry resumes from where the last one stopped, instead of restarting from 0) ---"
+            EXPECTED_MIN_SIZE=11000000
+            rm -f /tmp/ngrok.tgz
+
+            MAX_ATTEMPTS=8
+            ATTEMPT=1
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              EXISTING_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+              echo "--- Download attempt $ATTEMPT/$MAX_ATTEMPTS (resuming from ${EXISTING_SIZE} bytes) ---"
+
+              set +e
+              curl -fSL -C - --connect-timeout 15 --max-time 90 \
+                https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
+                -o /tmp/ngrok.tgz 2>/tmp/ngrok_dl_err.log
+              CURL_EXIT=$?
+              set -e
+
+              CURRENT_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+              echo "    result: curl_exit=$CURL_EXIT size=${CURRENT_SIZE} bytes"
+
+              if [ $CURL_EXIT -ne 0 ]; then
+                echo "    ⚠️ curl stderr: $(cat /tmp/ngrok_dl_err.log 2>/dev/null)"
+              fi
+
+              if [ "$CURRENT_SIZE" -ge "$EXPECTED_MIN_SIZE" ]; then
+                echo "✅ Download reached expected size (${CURRENT_SIZE} bytes)"
+                break
+              fi
+
+              ATTEMPT=$((ATTEMPT+1))
+              sleep 3
+            done
+
+            FINAL_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+            if [ "$FINAL_SIZE" -ge "$EXPECTED_MIN_SIZE" ]; then
+              echo "✅ Binary downloaded successfully after retries (${FINAL_SIZE} bytes)"
+              echo "--- Extracting ngrok binary to /usr/local/bin ---"
+              if ! sudo tar -xzf /tmp/ngrok.tgz -C /usr/local/bin; then
+                echo "❌ Failed to extract ngrok binary"
+                exit 1
+              fi
+              echo "✅ ngrok binary extracted"
+              NGROK_READY=1
+            else
+              echo "❌ Direct binary download failed after $MAX_ATTEMPTS attempts (final size: ${FINAL_SIZE} / needed ${EXPECTED_MIN_SIZE} bytes)"
+            fi
+          fi
+
+          if [ "$NGROK_READY" -eq 0 ]; then
+            echo "❌ Both apt install and direct binary download failed — cannot proceed"
             exit 1
           fi
 
