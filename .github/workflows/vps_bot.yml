@@ -246,11 +246,13 @@ jobs:
 
       - name: Run Task and Ping Pong Loop
         run: |
+          DURATION_MINUTES=120
+
           echo "==============================="
           echo "✅ VPN is ACTIVE"
           echo "✅ Receiver is ACTIVE on port 8081"
           echo "✅ Ngrok tunnel is ACTIVE at https://${{ secrets.NGROK_DOMAIN }}"
-          echo "⏱ Running for 240 minutes then handing off to Relay workflow..."
+          echo "⏱ Running for ${DURATION_MINUTES} minutes then handing off to Relay workflow..."
           echo "==============================="
 
           trigger_relay() {
@@ -268,7 +270,7 @@ jobs:
 
           FAILURE=0
 
-          for i in {1..240}; do
+          for i in $(seq 1 $DURATION_MINUTES); do
             CURRENT_IP=$(curl -s --max-time 10 https://ifconfig.me || echo "UNKNOWN")
 
             if pgrep openvpn > /dev/null; then
@@ -289,7 +291,7 @@ jobs:
               NGROK_STATUS="DEAD"
             fi
 
-            echo "✅ Minute $i/240 | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
+            echo "✅ Minute $i/$DURATION_MINUTES | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
 
             if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$NGROK_STATUS" == "DEAD" ]; then
               echo "❌ Something died at minute $i. Dumping logs..."
@@ -316,7 +318,7 @@ jobs:
             exit 1
           else
             echo "==============================="
-            echo "⏱ 240 minutes reached — normal handoff."
+            echo "⏱ ${DURATION_MINUTES} minutes reached — normal handoff."
             echo "==============================="
             trigger_relay
             echo "🏓 Workflow A complete — Workflow B now running."
