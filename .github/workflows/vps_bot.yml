@@ -321,23 +321,49 @@ jobs:
           trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Start Ngrok Tunnel"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
 
           echo "==============================="
-          echo "--- Downloading ngrok binary directly (no apt update needed) ---"
-          if ! curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
-            https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o /tmp/ngrok.tgz; then
-            echo "❌ Failed to download ngrok binary after retries (check if mirror is slow/down)"
-            ls -la /tmp/ngrok.tgz 2>/dev/null || echo "⚠️ No partial file was saved"
-            exit 1
+          echo "--- Attempt 1: Downloading ngrok binary from official bin.ngrok.com mirror ---"
+          DOWNLOAD_OK=0
+          if curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
+            https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o /tmp/ngrok.tgz; then
+            SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+            if [ "$SIZE" -gt 1000000 ]; then
+              echo "✅ Downloaded successfully from bin.ngrok.com (${SIZE} bytes)"
+              DOWNLOAD_OK=1
+            else
+              echo "⚠️ File downloaded but suspiciously small (${SIZE} bytes) — treating as failed"
+            fi
+          else
+            echo "⚠️ bin.ngrok.com download failed or timed out"
           fi
 
-          DOWNLOADED_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
-          echo "✅ ngrok binary downloaded (${DOWNLOADED_SIZE} bytes)"
+          if [ "$DOWNLOAD_OK" -eq 0 ]; then
+            echo "==============================="
+            echo "--- Attempt 2: Fallback — installing ngrok via apt repository ---"
+            if curl -sSL --connect-timeout 15 --max-time 30 https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null; then
+              echo "✅ ngrok GPG key added"
+              echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null
+              if sudo apt-get update && sudo apt-get install -y ngrok; then
+                echo "✅ ngrok installed via apt fallback"
+                DOWNLOAD_OK=1
+              else
+                echo "❌ apt-based ngrok install also failed"
+              fi
+            else
+              echo "❌ Could not fetch ngrok GPG key for apt fallback"
+            fi
+          else
+            echo "--- Extracting ngrok binary to /usr/local/bin ---"
+            if ! sudo tar -xzf /tmp/ngrok.tgz -C /usr/local/bin; then
+              echo "❌ Failed to extract ngrok binary"
+              exit 1
+            fi
+            echo "✅ ngrok binary extracted"
+          fi
 
-          echo "--- Extracting ngrok binary to /usr/local/bin ---"
-          if ! sudo tar -xzf /tmp/ngrok.tgz -C /usr/local/bin; then
-            echo "❌ Failed to extract ngrok binary"
+          if [ "$DOWNLOAD_OK" -eq 0 ]; then
+            echo "❌ Both download methods failed — cannot proceed"
             exit 1
           fi
-          echo "✅ ngrok binary extracted"
 
           echo "--- Verifying ngrok binary ---"
           if ! ngrok version; then
@@ -374,11 +400,7 @@ jobs:
           echo "--- Ngrok Tunnel Status (API) ---"
           set +e
           curl -s --connect-timeout 5 --max-time 10 http://localhost:4040/api/tunnels
-          TUNNELS_EXIT=$?
           set -e
-          if [ $TUNNELS_EXIT -ne 0 ]; then
-            echo "⚠️ Could not reach ngrok local API (non-fatal) — curl exit code $TUNNELS_EXIT"
-          fi
           echo ""
           echo "==============================="
 
