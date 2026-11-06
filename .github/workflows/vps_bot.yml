@@ -129,7 +129,7 @@ jobs:
           echo "==============================="
           echo "GitHub Runner IP (Before VPN):"
           set +e
-          BEFORE_IP=$(curl -s --max-time 10 https://ifconfig.me 2>/tmp/before_ip_err.log)
+          BEFORE_IP=$(curl -s --connect-timeout 10 --max-time 20 https://ifconfig.me 2>/tmp/before_ip_err.log)
           BEFORE_EXIT=$?
           set -e
           if [ $BEFORE_EXIT -ne 0 ]; then
@@ -206,7 +206,7 @@ jobs:
           echo "==============================="
           echo "Exit IP (After VPN):"
           set +e
-          CURRENT_IP=$(curl -s --max-time 10 https://ifconfig.me 2>/tmp/after_ip_err.log)
+          CURRENT_IP=$(curl -s --connect-timeout 10 --max-time 20 https://ifconfig.me 2>/tmp/after_ip_err.log)
           IP_EXIT=$?
           set -e
           if [ $IP_EXIT -ne 0 ]; then
@@ -221,7 +221,7 @@ jobs:
           echo "Location Details:"
           if [ "$CURRENT_IP" != "UNKNOWN" ]; then
             set +e
-            curl -s --max-time 10 https://ipinfo.io/$CURRENT_IP 2>/tmp/ipinfo_err.log
+            curl -s --connect-timeout 10 --max-time 20 https://ipinfo.io/$CURRENT_IP 2>/tmp/ipinfo_err.log
             IPINFO_EXIT=$?
             set -e
             if [ $IPINFO_EXIT -ne 0 ]; then
@@ -291,7 +291,7 @@ jobs:
 
           echo "--- Testing receiver with curl ---"
           set +e
-          HTTP_CODE=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" --max-time 10 http://localhost:8081/ 2>/tmp/receiver_curl_err.log)
+          HTTP_CODE=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:8081/ 2>/tmp/receiver_curl_err.log)
           CURL_EXIT=$?
           set -e
 
@@ -322,12 +322,15 @@ jobs:
 
           echo "==============================="
           echo "--- Downloading ngrok binary directly (no apt update needed) ---"
-          if ! curl -fsSL --max-time 30 --retry 3 --retry-delay 2 \
+          if ! curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
             https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o /tmp/ngrok.tgz; then
-            echo "❌ Failed to download ngrok binary after retries"
+            echo "❌ Failed to download ngrok binary after retries (check if mirror is slow/down)"
+            ls -la /tmp/ngrok.tgz 2>/dev/null || echo "⚠️ No partial file was saved"
             exit 1
           fi
-          echo "✅ ngrok binary downloaded"
+
+          DOWNLOADED_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+          echo "✅ ngrok binary downloaded (${DOWNLOADED_SIZE} bytes)"
 
           echo "--- Extracting ngrok binary to /usr/local/bin ---"
           if ! sudo tar -xzf /tmp/ngrok.tgz -C /usr/local/bin; then
@@ -370,7 +373,7 @@ jobs:
 
           echo "--- Ngrok Tunnel Status (API) ---"
           set +e
-          curl -s --max-time 10 http://localhost:4040/api/tunnels
+          curl -s --connect-timeout 5 --max-time 10 http://localhost:4040/api/tunnels
           TUNNELS_EXIT=$?
           set -e
           if [ $TUNNELS_EXIT -ne 0 ]; then
@@ -384,7 +387,7 @@ jobs:
 
           echo "--- Verifying public URL responds ---"
           set +e
-          PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://${{ secrets.NGROK_DOMAIN }}/ 2>/tmp/public_url_err.log)
+          PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 https://${{ secrets.NGROK_DOMAIN }}/ 2>/tmp/public_url_err.log)
           PUBLIC_EXIT=$?
           set -e
 
@@ -423,7 +426,7 @@ jobs:
             echo "==============================="
             echo "🔄 Triggering Relay workflow (relay_ping)..."
             set +e
-            curl -s -X POST --max-time 15 \
+            curl -s -X POST --connect-timeout 10 --max-time 15 \
               -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/${{ github.repository }}/dispatches \
@@ -443,7 +446,7 @@ jobs:
 
           for i in $(seq 1 $DURATION_MINUTES); do
             set +e
-            CURRENT_IP=$(curl -s --max-time 10 https://ifconfig.me 2>/tmp/loop_ip_err.log)
+            CURRENT_IP=$(curl -s --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/tmp/loop_ip_err.log)
             IP_EXIT=$?
             set -e
 
