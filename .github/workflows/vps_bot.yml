@@ -431,15 +431,19 @@ jobs:
           NGROK_PID=$!
           echo "✅ ngrok PID: $NGROK_PID"
 
-          sleep 8
+          sleep 10
 
           echo "--- Ngrok Log ---"
-          cat /tmp/ngrok.log
+          if [ -s /tmp/ngrok.log ]; then
+            cat /tmp/ngrok.log
+          else
+            echo "(ngrok.log is empty — this is sometimes normal for the apt-packaged ngrok binary, not necessarily an error)"
+          fi
           echo "==============================="
 
           if ! pgrep ngrok > /dev/null; then
             echo "❌ ngrok process is NOT running after startup"
-            cat /tmp/ngrok.log
+            cat /tmp/ngrok.log 2>/dev/null || true
             exit 1
           fi
           echo "✅ ngrok process is alive"
@@ -454,26 +458,50 @@ jobs:
           echo "✅ Binance Receiver URL: https://${{ secrets.NGROK_DOMAIN }}"
           echo "==============================="
 
-          echo "--- Verifying public URL responds ---"
-          set +e
-          PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 https://${{ secrets.NGROK_DOMAIN }}/ 2>/tmp/public_url_err.log)
-          PUBLIC_EXIT=$?
-          set -e
+          echo "--- Verifying public URL responds (retrying on transient cold-start failures) ---"
+          echo "ℹ️ curl exit code reference: 6=DNS resolve failure, 7=connection refused, 28=timeout, 35=SSL error, 52=empty reply, 56=network receive error/reset"
 
-          if [ $PUBLIC_EXIT -ne 0 ]; then
-            echo "❌ curl to public ngrok URL failed — exit code $PUBLIC_EXIT: $(cat /tmp/public_url_err.log 2>/dev/null)"
-            cat /tmp/ngrok.log
+          PUBLIC_OK=0
+          MAX_PUBLIC_ATTEMPTS=5
+          ATTEMPT=1
+
+          while [ $ATTEMPT -le $MAX_PUBLIC_ATTEMPTS ]; do
+            echo "--- Public URL check attempt $ATTEMPT/$MAX_PUBLIC_ATTEMPTS ---"
+            set +e
+            PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 https://${{ secrets.NGROK_DOMAIN }}/ 2>/tmp/public_url_err.log)
+            PUBLIC_EXIT=$?
+            set -e
+
+            if [ $PUBLIC_EXIT -eq 0 ] && [ "$PUBLIC_STATUS" != "000" ]; then
+              echo "✅ Public URL responded with HTTP $PUBLIC_STATUS on attempt $ATTEMPT"
+              PUBLIC_OK=1
+              break
+            fi
+
+            if [ $PUBLIC_EXIT -ne 0 ]; then
+              echo "⚠️ Attempt $ATTEMPT failed — curl exit code $PUBLIC_EXIT: $(cat /tmp/public_url_err.log 2>/dev/null)"
+            else
+              echo "⚠️ Attempt $ATTEMPT got HTTP 000 (unreachable)"
+            fi
+
+            ATTEMPT=$((ATTEMPT+1))
+            sleep 5
+          done
+
+          if [ "$PUBLIC_OK" -eq 0 ]; then
+            echo "==============================="
+            echo "❌ Public URL still unreachable after $MAX_PUBLIC_ATTEMPTS attempts"
+            echo "--- Ngrok Log ---"
+            cat /tmp/ngrok.log 2>/dev/null || echo "(empty or unreadable)"
+            echo "--- Ngrok API Status (final check) ---"
+            curl -s --connect-timeout 5 --max-time 10 http://localhost:4040/api/tunnels || true
+            echo ""
             exit 1
           fi
 
-          echo "Public URL responded with status: $PUBLIC_STATUS"
-          if [ "$PUBLIC_STATUS" == "000" ]; then
-            echo "❌ Ngrok tunnel is NOT reachable publicly"
-            cat /tmp/ngrok.log
-            exit 1
-          else
-            echo "✅ Ngrok tunnel is publicly reachable"
-          fi
+          echo "==============================="
+          echo "✅ Ngrok tunnel is publicly reachable"
+          echo "==============================="
 
       - name: Run Task and Ping Pong Loop
         run: |
