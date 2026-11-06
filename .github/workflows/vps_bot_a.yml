@@ -1,14 +1,13 @@
-name: Continuous VPN Worker - Instance A
+name: Continuous VPN Worker
 
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [trigger_a]
+    types: [restart_vpn]
 
 jobs:
-  run-instance-a:
+  run-vpn-task:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -38,13 +37,13 @@ jobs:
           check_secret "VPN_USERNAME" "${{ secrets.VPN_USERNAME }}"
           check_secret "VPN_PASSWORD" "${{ secrets.VPN_PASSWORD }}"
           check_secret "VPN_CONFIG" "${{ secrets.VPN_CONFIG }}"
+          check_secret "NGROK_AUTHTOKEN" "${{ secrets.NGROK_AUTHTOKEN }}"
+          check_secret "NGROK_DOMAIN" "${{ secrets.NGROK_DOMAIN }}"
           check_secret "GH_TOKEN" "${{ secrets.GH_TOKEN }}"
-          check_secret "WORKER_URL" "${{ secrets.WORKER_URL }}"
-          check_secret "REGISTER_SECRET" "${{ secrets.REGISTER_SECRET }}"
 
           if [ "$MISSING" -eq 1 ]; then
             echo "==============================="
-            echo "❌ One or more required secrets are missing. Aborting."
+            echo "❌ One or more required secrets are missing. Aborting before any VPN/ngrok work begins."
             echo "==============================="
             exit 1
           fi
@@ -258,22 +257,6 @@ jobs:
           sudo cat /tmp/vpn.log
           echo "==============================="
 
-      - name: Check Exit IP Gate
-        run: |
-          EXPECTED="${{ secrets.EXPECTED_EXIT_IP }}"
-          if [ -z "$EXPECTED" ]; then
-            echo "⚠️ EXPECTED_EXIT_IP not set — gate skipped. Save the IP above as that secret after this run."
-          else
-            ACTUAL=$(curl -s --max-time 10 https://ifconfig.me || echo "UNKNOWN")
-            echo "Expected: $EXPECTED"
-            echo "Actual:   $ACTUAL"
-            if [ "$ACTUAL" != "$EXPECTED" ]; then
-              echo "❌ Exit IP mismatch"
-              exit 1
-            fi
-            echo "✅ Exit IP matches"
-          fi
-
       - name: Start Receiver
         run: |
           set -Eeuo pipefail
@@ -332,130 +315,230 @@ jobs:
             echo "✅ Receiver responded with HTTP $HTTP_CODE (server is up)"
           fi
 
-      - name: Start Cloudflared Quick Tunnel and Register
+      - name: Start Ngrok Tunnel
         run: |
           set -Eeuo pipefail
-          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Start Cloudflared"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Start Ngrok Tunnel"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          NGROK_READY=0
 
           echo "==============================="
-          echo "--- Downloading cloudflared binary ---"
-          curl -fsSL --connect-timeout 15 --max-time 60 -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          if [ $? -ne 0 ]; then
-            echo "❌ Failed to download cloudflared binary"
+          echo "--- Attempt 1: Installing ngrok via apt repository (small chunked fetch, more reliable than one big CDN file) ---"
+          set +e
+          curl -sSL --connect-timeout 15 --max-time 30 https://ngrok-agent.s3.amazonaws.com/ngrok.asc 2>/tmp/apt_key_err.log | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          KEY_EXIT=$?
+          set -e
+
+          if [ $KEY_EXIT -eq 0 ] && [ -s /etc/apt/trusted.gpg.d/ngrok.asc ]; then
+            echo "✅ ngrok GPG key added"
+            echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null
+
+            set +e
+            sudo apt-get update
+            UPDATE_EXIT=$?
+            set -e
+
+            if [ $UPDATE_EXIT -eq 0 ]; then
+              set +e
+              sudo apt-get install -y ngrok
+              INSTALL_EXIT=$?
+              set -e
+              if [ $INSTALL_EXIT -eq 0 ] && command -v ngrok > /dev/null 2>&1; then
+                echo "✅ ngrok installed via apt"
+                NGROK_READY=1
+              else
+                echo "⚠️ apt-get install ngrok failed (exit $INSTALL_EXIT) — will try direct binary download"
+              fi
+            else
+              echo "⚠️ apt-get update failed after adding ngrok repo (exit $UPDATE_EXIT) — will try direct binary download"
+            fi
+          else
+            echo "⚠️ Failed to fetch ngrok GPG key (curl exit $KEY_EXIT) — skipping apt method, trying direct binary download"
+          fi
+
+          if [ "$NGROK_READY" -eq 0 ]; then
+            echo "==============================="
+            echo "--- Attempt 2: Fallback — direct binary download with RESUME + multiple short retries ---"
+            echo "--- (fixes stalled-transfer problem: each retry resumes from where the last one stopped, instead of restarting from 0) ---"
+            EXPECTED_MIN_SIZE=11000000
+            rm -f /tmp/ngrok.tgz
+
+            MAX_ATTEMPTS=8
+            ATTEMPT=1
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              EXISTING_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+              echo "--- Download attempt $ATTEMPT/$MAX_ATTEMPTS (resuming from ${EXISTING_SIZE} bytes) ---"
+
+              set +e
+              curl -fSL -C - --connect-timeout 15 --max-time 90 \
+                https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
+                -o /tmp/ngrok.tgz 2>/tmp/ngrok_dl_err.log
+              CURL_EXIT=$?
+              set -e
+
+              CURRENT_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+              echo "    result: curl_exit=$CURL_EXIT size=${CURRENT_SIZE} bytes"
+
+              if [ $CURL_EXIT -ne 0 ]; then
+                echo "    ⚠️ curl stderr: $(cat /tmp/ngrok_dl_err.log 2>/dev/null)"
+              fi
+
+              if [ "$CURRENT_SIZE" -ge "$EXPECTED_MIN_SIZE" ]; then
+                echo "✅ Download reached expected size (${CURRENT_SIZE} bytes)"
+                break
+              fi
+
+              ATTEMPT=$((ATTEMPT+1))
+              sleep 3
+            done
+
+            FINAL_SIZE=$(stat -c%s /tmp/ngrok.tgz 2>/dev/null || echo "0")
+            if [ "$FINAL_SIZE" -ge "$EXPECTED_MIN_SIZE" ]; then
+              echo "✅ Binary downloaded successfully after retries (${FINAL_SIZE} bytes)"
+              echo "--- Extracting ngrok binary to /usr/local/bin ---"
+              if ! sudo tar -xzf /tmp/ngrok.tgz -C /usr/local/bin; then
+                echo "❌ Failed to extract ngrok binary"
+                exit 1
+              fi
+              echo "✅ ngrok binary extracted"
+              NGROK_READY=1
+            else
+              echo "❌ Direct binary download failed after $MAX_ATTEMPTS attempts (final size: ${FINAL_SIZE} / needed ${EXPECTED_MIN_SIZE} bytes)"
+            fi
+          fi
+
+          if [ "$NGROK_READY" -eq 0 ]; then
+            echo "❌ Both apt install and direct binary download failed — cannot proceed"
             exit 1
           fi
-          echo "✅ cloudflared binary downloaded"
 
-          chmod +x /tmp/cloudflared
-          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          echo "--- Verifying ngrok binary ---"
+          if ! ngrok version; then
+            echo "❌ ngrok binary not working"
+            exit 1
+          fi
+          echo "✅ ngrok installed and verified"
 
-          echo "--- Verifying cloudflared binary ---"
-          cloudflared --version || { echo "❌ cloudflared binary not working"; exit 1; }
-          echo "✅ cloudflared installed and verified"
+          echo "--- Configuring ngrok authtoken ---"
+          if ! ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}; then
+            echo "❌ Failed to configure ngrok authtoken"
+            exit 1
+          fi
+          echo "✅ authtoken configured"
 
-          echo "--- Starting cloudflared quick tunnel ---"
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8081 > /tmp/cloudflared.log 2>&1 &
-          CF_PID=$!
-          echo "✅ cloudflared PID: $CF_PID"
+          echo "--- Starting ngrok tunnel on static domain ---"
+          nohup ngrok http 8081 --url=${{ secrets.NGROK_DOMAIN }} > /tmp/ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "✅ ngrok PID: $NGROK_PID"
 
-          echo "--- Waiting for tunnel URL ---"
-          URL=""
-          for i in {1..30}; do
-            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log | grep -v '^https://api\.' | head -1 || true)
-            if [ -n "$URL" ]; then
-              echo "✅ Tunnel URL found: $URL"
+          sleep 10
+
+          echo "--- Ngrok Log ---"
+          if [ -s /tmp/ngrok.log ]; then
+            cat /tmp/ngrok.log
+          else
+            echo "(ngrok.log is empty — this is sometimes normal for the apt-packaged ngrok binary, not necessarily an error)"
+          fi
+          echo "==============================="
+
+          if ! pgrep ngrok > /dev/null; then
+            echo "❌ ngrok process is NOT running after startup"
+            cat /tmp/ngrok.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ ngrok process is alive"
+
+          echo "--- Ngrok Tunnel Status (API) ---"
+          set +e
+          curl -s --connect-timeout 5 --max-time 10 http://localhost:4040/api/tunnels
+          set -e
+          echo ""
+          echo "==============================="
+
+          echo "✅ Binance Receiver URL: https://${{ secrets.NGROK_DOMAIN }}"
+          echo "==============================="
+
+          echo "--- Verifying public URL responds (retrying on transient cold-start failures) ---"
+          echo "ℹ️ curl exit code reference: 6=DNS resolve failure, 7=connection refused, 28=timeout, 35=SSL error, 52=empty reply, 56=network receive error/reset"
+
+          PUBLIC_OK=0
+          MAX_PUBLIC_ATTEMPTS=5
+          ATTEMPT=1
+
+          while [ $ATTEMPT -le $MAX_PUBLIC_ATTEMPTS ]; do
+            echo "--- Public URL check attempt $ATTEMPT/$MAX_PUBLIC_ATTEMPTS ---"
+            set +e
+            PUBLIC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 https://${{ secrets.NGROK_DOMAIN }}/ 2>/tmp/public_url_err.log)
+            PUBLIC_EXIT=$?
+            set -e
+
+            if [ $PUBLIC_EXIT -eq 0 ] && [ "$PUBLIC_STATUS" != "000" ]; then
+              echo "✅ Public URL responded with HTTP $PUBLIC_STATUS on attempt $ATTEMPT"
+              PUBLIC_OK=1
               break
             fi
-            sleep 2
+
+            if [ $PUBLIC_EXIT -ne 0 ]; then
+              echo "⚠️ Attempt $ATTEMPT failed — curl exit code $PUBLIC_EXIT: $(cat /tmp/public_url_err.log 2>/dev/null)"
+            else
+              echo "⚠️ Attempt $ATTEMPT got HTTP 000 (unreachable)"
+            fi
+
+            ATTEMPT=$((ATTEMPT+1))
+            sleep 5
           done
 
-          if [ -z "$URL" ]; then
-            echo "❌ No tunnel URL found after 60 seconds"
-            cat /tmp/cloudflared.log
+          if [ "$PUBLIC_OK" -eq 0 ]; then
+            echo "==============================="
+            echo "❌ Public URL still unreachable after $MAX_PUBLIC_ATTEMPTS attempts"
+            echo "--- Ngrok Log ---"
+            cat /tmp/ngrok.log 2>/dev/null || echo "(empty or unreadable)"
+            echo "--- Ngrok API Status (final check) ---"
+            curl -s --connect-timeout 5 --max-time 10 http://localhost:4040/api/tunnels || true
+            echo ""
             exit 1
           fi
 
-          echo "$URL" > /tmp/tunnel_url.txt
-
-          echo "--- Verifying public chain (tunnel -> receiver -> VPN -> Binance) ---"
-          OK=0
-          for i in {1..20}; do
-            set +e
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 "$URL/fapi/v1/ping" 2>/tmp/chain_err.log)
-            CHAIN_EXIT=$?
-            set -e
-            echo "Public chain test $i: HTTP $CODE (curl exit $CHAIN_EXIT)"
-            if [ "$CODE" == "200" ]; then OK=1; break; fi
-            sleep 3
-          done
-
-          if [ "$OK" != "1" ]; then
-            echo "❌ Public chain never returned 200"
-            echo "--- Cloudflared Log ---"
-            cat /tmp/cloudflared.log
-            echo "--- Receiver Log ---"
-            cat /tmp/receiver.log
-            exit 1
-          fi
-          echo "✅ Public chain works"
-
-          echo "--- Registering with tunnel-proxy ---"
-          RESP=""
-          for n in 1 2 3; do
-            set +e
-            RESP=$(curl -s --connect-timeout 10 --max-time 15 -X POST "${{ secrets.WORKER_URL }}/__register" \
-              -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"instance\":\"A\",\"url\":\"$URL\"}" 2>/tmp/register_err.log)
-            REG_EXIT=$?
-            set -e
-            echo "Register attempt $n: '$RESP' (curl exit $REG_EXIT)"
-            if [ "$RESP" == "ok" ]; then break; fi
-            sleep 3
-          done
-
-          if [ "$RESP" != "ok" ]; then
-            echo "❌ Registration failed"
-            cat /tmp/register_err.log 2>/dev/null || true
-            exit 1
-          fi
-          echo "✅ Registered with tunnel-proxy"
+          echo "==============================="
+          echo "✅ Ngrok tunnel is publicly reachable"
           echo "==============================="
 
-      - name: Run Task and Ping Pong Loop (Instance A)
+      - name: Run Task and Ping Pong Loop
         run: |
           set -Eeuo pipefail
           trap 'echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Run Task and Ping Pong Loop"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"; echo "Timestamp (UTC): $(date -u +"%Y-%m-%dT%H:%M:%SZ")"' ERR
 
-          DURATION_MINUTES=130
+          DURATION_MINUTES=120
 
           echo "==============================="
           echo "✅ VPN is ACTIVE"
           echo "✅ Receiver is ACTIVE on port 8081"
-          echo "✅ Cloudflared tunnel is ACTIVE"
-          echo "⏱ Running for ${DURATION_MINUTES} minutes. At minute 100, Instance A2 will be triggered."
+          echo "✅ Ngrok tunnel is ACTIVE at https://${{ secrets.NGROK_DOMAIN }}"
+          echo "⏱ Running for ${DURATION_MINUTES} minutes then handing off to Relay workflow..."
+          echo "==============================="
+          echo "ℹ️ curl exit code reference: 6=DNS resolve failure, 7=connection refused, 28=timeout, 35=SSL error, 52=empty reply, 56=network receive error"
           echo "==============================="
 
-          trigger_a2() {
+          trigger_relay() {
             echo "==============================="
-            echo "🔄 Triggering Instance A2 (trigger_a2)..."
+            echo "🔄 Triggering Relay workflow (relay_ping)..."
             set +e
             curl -s -X POST --connect-timeout 10 --max-time 15 \
               -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/${{ github.repository }}/dispatches \
-              -d '{"event_type": "trigger_a2"}'
-            TRIGGER_EXIT=$?
+              -d '{"event_type": "relay_ping"}'
+            RELAY_EXIT=$?
             set -e
-            if [ $TRIGGER_EXIT -ne 0 ]; then
-              echo "⚠️ A2 trigger curl failed — exit code $TRIGGER_EXIT"
+            if [ $RELAY_EXIT -ne 0 ]; then
+              echo "⚠️ Relay trigger curl failed — exit code $RELAY_EXIT (non-fatal, chain may need manual restart)"
             else
-              echo "✅ Instance A2 trigger attempted!"
+              echo ""
+              echo "✅ Relay workflow trigger attempted!"
             fi
             echo "==============================="
           }
 
-          A2_TRIGGERED=0
           FAILURE=0
 
           for i in $(seq 1 $DURATION_MINUTES); do
@@ -466,6 +549,7 @@ jobs:
 
             if [ $IP_EXIT -ne 0 ]; then
               CURRENT_IP="UNKNOWN(curl_exit=$IP_EXIT)"
+              echo "⚠️ [Minute $i] IP check curl failed — exit code $IP_EXIT: $(cat /tmp/loop_ip_err.log 2>/dev/null)"
             fi
 
             if pgrep openvpn > /dev/null; then
@@ -480,33 +564,24 @@ jobs:
               RECEIVER_STATUS="DEAD"
             fi
 
-            if pgrep -f "cloudflared tunnel" > /dev/null; then
-              CF_STATUS="ACTIVE"
+            if pgrep ngrok > /dev/null; then
+              NGROK_STATUS="ACTIVE"
             else
-              CF_STATUS="DEAD"
+              NGROK_STATUS="DEAD"
             fi
 
-            echo "✅ [$(date -u +"%H:%M:%S")] Minute $i/$DURATION_MINUTES | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Cloudflared: $CF_STATUS | IP: $CURRENT_IP"
+            echo "✅ [$(date -u +"%H:%M:%S")] Minute $i/$DURATION_MINUTES | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Ngrok: $NGROK_STATUS | IP: $CURRENT_IP"
 
-            if [ "$i" -eq 100 ] && [ "$A2_TRIGGERED" -eq 0 ]; then
-              echo "⏱ Minute 100 — triggering Instance A2 (overlap window begins)"
-              trigger_a2
-              A2_TRIGGERED=1
-            fi
-
-            if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$CF_STATUS" == "DEAD" ]; then
+            if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$NGROK_STATUS" == "DEAD" ]; then
               echo "❌ Something died at minute $i. Dumping logs..."
               echo "--- VPN Log ---"
               sudo cat /tmp/vpn.log || echo "⚠️ could not read vpn.log"
               echo "--- Receiver Log ---"
               cat /tmp/receiver.log || echo "⚠️ could not read receiver.log"
-              echo "--- Cloudflared Log ---"
-              cat /tmp/cloudflared.log || echo "⚠️ could not read cloudflared.log"
-              if [ "$A2_TRIGGERED" -eq 0 ]; then
-                echo "🔄 Triggering emergency A2 start before exiting..."
-                trigger_a2
-                A2_TRIGGERED=1
-              fi
+              echo "--- Ngrok Log ---"
+              cat /tmp/ngrok.log || echo "⚠️ could not read ngrok.log"
+              echo "🔄 Triggering emergency relay before exiting to keep chain alive..."
+              trigger_relay
               FAILURE=1
               break
             fi
@@ -516,25 +591,15 @@ jobs:
 
           if [ "$FAILURE" == "1" ]; then
             echo "==============================="
-            echo "❌ Instance A exiting with FAILURE status (component died early at minute $i)"
-            echo "✅ Overlap preserved — Instance A2 was already triggered before exit"
+            echo "❌ Workflow A exiting with FAILURE status (component died early at minute $i)"
+            echo "✅ Chain preserved — Relay workflow was already triggered before exit"
             echo "==============================="
             exit 1
           else
             echo "==============================="
-            echo "⏱ ${DURATION_MINUTES} minutes reached — Instance A shutting down normally."
-            echo "✅ Instance A2 should already be active and serving traffic."
+            echo "⏱ ${DURATION_MINUTES} minutes reached — normal handoff."
             echo "==============================="
-          fi
-
-      - name: Deregister from tunnel-proxy
-        if: always()
-        run: |
-          if [ -f /tmp/tunnel_url.txt ]; then
-            URL=$(cat /tmp/tunnel_url.txt)
-            curl -s --max-time 15 -X POST "${{ secrets.WORKER_URL }}/__deregister" \
-              -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"instance\":\"A\",\"url\":\"$URL\"}" || true
-            echo "✅ Deregistered from tunnel-proxy"
+            trigger_relay
+            echo "🏓 Workflow A complete — Workflow B now running."
+            echo "==============================="
           fi
