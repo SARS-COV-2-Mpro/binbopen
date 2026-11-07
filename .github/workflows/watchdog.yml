@@ -1,0 +1,32 @@
+name: Continuous VPN Watchdog
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  auto-heal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Tunnel Status and Revive
+        run: |
+          set -Eeuo pipefail
+          STATUS=$(curl -s --max-time 10 "${{ secrets.WORKER_URL }}/__status" -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" || true)
+          echo "Current Status:"
+          echo "$STATUS"
+
+          HAS_A=$(echo "$STATUS" | grep -o '"A":' || true)
+          HAS_A2=$(echo "$STATUS" | grep -o '"A2":' || true)
+
+          if [ -z "$HAS_A" ] && [ -z "$HAS_A2" ]; then
+            echo "🚨 No live tunnel found! Auto-restarting Instance A..."
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+              -d '{"event_type":"trigger_a"}' || true)
+            echo "Trigger A result: HTTP $CODE"
+          else
+            echo "✅ At least one instance is alive. No action needed."
+          fi
