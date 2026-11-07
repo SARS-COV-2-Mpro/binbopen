@@ -2,6 +2,13 @@ name: Continuous VPN Worker - Instance A
 
 on:
   workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Run minutes (test: 8)'
+        default: '300'
+      trigger:
+        description: 'Handoff minute (test: 5)'
+        default: '295'
   repository_dispatch:
     types: [trigger_a]
 
@@ -12,8 +19,8 @@ jobs:
     env:
       INSTANCE: "A"
       OTHER_EVENT: "trigger_a2"
-      DURATION_MINUTES: "300"
-      TRIGGER_MINUTE: "295"
+      DURATION_MINUTES: ${{ github.event.client_payload.duration || github.event.inputs.duration || '300' }}
+      TRIGGER_MINUTE: ${{ github.event.client_payload.trigger || github.event.inputs.trigger || '295' }}
       HEARTBEAT_EVERY: "5"
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
       WORKER_URL: ${{ secrets.WORKER_URL }}
@@ -24,15 +31,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
+      - name: Job Info
+        run: |
+          echo "Job started (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "Instance: $INSTANCE | other: $OTHER_EVENT"
+          echo "Event: ${{ github.event_name }} | run id: ${{ github.run_id }}"
+          echo "Duration: $DURATION_MINUTES min | handoff at minute $TRIGGER_MINUTE | heartbeat every $HEARTBEAT_EVERY min"
+          echo "Runner: $(uname -sr) | $(nproc) CPU | $(free -m | awk '/Mem:/{print $2" MB RAM"}')"
+
       - name: Download cloudflared (before VPN)
         run: |
           set -Eeuo pipefail
-          trap 'echo "❌ Error on line $LINENO"' ERR
+          trap 'echo "Error on line $LINENO"' ERR
           curl -fsSL --retry 5 --retry-delay 3 -o cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
           ./cloudflared --version
-          echo "✅ cloudflared downloaded"
+          echo "cloudflared downloaded"
 
       - name: Validate Required Secrets
         env:
@@ -44,46 +59,64 @@ jobs:
           MISSING=0
           for V in VPN_CONFIG VPN_USERNAME VPN_PASSWORD GH_TOKEN WORKER_URL REGISTER_SECRET; do
             if [ -z "${!V:-}" ]; then
-              echo "❌ Missing secret: $V"
+              echo "Missing secret: $V"
               MISSING=1
             else
-              echo "✅ $V is set"
+              echo "$V is set"
             fi
           done
+          if [ -n "${EXPECTED_EXIT_IP:-}" ]; then echo "EXPECTED_EXIT_IP is set"; else echo "EXPECTED_EXIT_IP not set (gate is non-strict)"; fi
+          if ! [[ "$DURATION_MINUTES" =~ ^[0-9]+$ ]] || ! [[ "$TRIGGER_MINUTE" =~ ^[0-9]+$ ]]; then
+            echo "DURATION_MINUTES/TRIGGER_MINUTE must be numbers (got '$DURATION_MINUTES' / '$TRIGGER_MINUTE')"
+            MISSING=1
+          elif [ "$TRIGGER_MINUTE" -ge "$DURATION_MINUTES" ]; then
+            echo "TRIGGER_MINUTE must be smaller than DURATION_MINUTES"
+            MISSING=1
+          fi
           if [ "$MISSING" = "1" ]; then exit 1; fi
 
-      - name: Create Startup Failover Helper
+      - name: Create Helper Scripts
         run: |
           set -Eeuo pipefail
-          cat > startup_fail.sh <<'EOF'
+          cat > startup_fail.sh <<'ENDSCRIPT'
           #!/usr/bin/env bash
-          echo "🚨 STARTUP FAILURE: $1"
+          echo "STARTUP FAILURE at $(date -u +%H:%M:%S): $1"
           for i in 1 2 3; do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 20 -X POST \
               -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$GITHUB_REPOSITORY/dispatches" \
-              -d "{\"event_type\":\"$OTHER_EVENT\"}" || true)
-            echo "🔔 Trigger $OTHER_EVENT -> HTTP $CODE"
+              -d "{\"event_type\":\"$OTHER_EVENT\",\"client_payload\":{\"duration\":\"$DURATION_MINUTES\",\"trigger\":\"$TRIGGER_MINUTE\"}}" || true)
+            echo "Trigger $OTHER_EVENT -> HTTP $CODE"
             if [ "$CODE" = "204" ]; then break; fi
             sleep 3
           done
           sudo pkill -x openvpn || true
           exit 0
-          EOF
-          chmod +x startup_fail.sh
+          ENDSCRIPT
+          cat > start_cf.sh <<'ENDSCRIPT'
+          #!/usr/bin/env bash
+          if [ "${CF_MODE:-vpn}" = "isolated" ]; then
+            nohup sudo -u cfuser env HOME=/tmp /usr/local/bin/cfd tunnel --url http://127.0.0.1:8081 --protocol http2 --no-autoupdate > cloudflared.log 2>&1 < /dev/null &
+          else
+            nohup ./cloudflared tunnel --url http://127.0.0.1:8081 --protocol http2 --no-autoupdate > cloudflared.log 2>&1 < /dev/null &
+          fi
+          exit 0
+          ENDSCRIPT
+          chmod +x startup_fail.sh start_cf.sh
+          echo "helper scripts created"
 
       - name: Install OpenVPN
         run: |
           set -Eeuo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq openvpn curl jq
-          echo "✅ OpenVPN installed"
+          echo "OpenVPN installed: $(openvpn --version | head -1)"
 
       - name: Setup VPN Credentials
         run: |
           set -Eeuo pipefail
-          trap 'echo "❌ Error on line $LINENO"' ERR
+          trap 'echo "Error on line $LINENO"' ERR
           echo "${{ secrets.VPN_CONFIG }}" > config.ovpn
           echo "${{ secrets.VPN_USERNAME }}" > pass.txt
           echo "${{ secrets.VPN_PASSWORD }}" >> pass.txt
@@ -95,21 +128,30 @@ jobs:
           if ! grep -q '^auth-user-pass' config.ovpn; then echo "auth-user-pass pass.txt" >> config.ovpn; fi
           echo "data-ciphers AES-128-CBC" >> config.ovpn
           echo "data-ciphers-fallback AES-128-CBC" >> config.ovpn
-          echo "✅ VPN credentials and config prepared"
+          echo "VPN credentials and config prepared"
+          echo "config lines: $(wc -l < config.ovpn) | remote: $(grep -m1 '^remote ' config.ovpn || echo '?') | proto: $(grep -m1 '^proto ' config.ovpn || echo '?')"
 
       - name: Check IP Before VPN
         run: |
           set -Eeuo pipefail
           IP=$(curl -s -m 10 https://ifconfig.me || echo "UNKNOWN")
-          echo "🌍 IP before VPN: $IP"
+          GW=$(ip route show default | awk '/default/{print $3; exit}')
+          DEV=$(ip route show default | awk '/default/{print $5; exit}')
+          echo "IP before VPN: $IP"
+          echo "Original gateway: $GW via $DEV"
+          echo "PRE_IP=$IP" >> "$GITHUB_ENV"
+          echo "ORIG_GW=$GW" >> "$GITHUB_ENV"
+          echo "ORIG_DEV=$DEV" >> "$GITHUB_ENV"
 
       - name: Start VPN
         run: |
           set -Eeuo pipefail
-          trap 'echo "❌ Error on line $LINENO"' ERR
+          trap 'echo "Error on line $LINENO"' ERR
+          T0=$(date +%s)
           CONNECTED=0
+          AUTH_FAILS=0
           for ATTEMPT in $(seq 1 80); do
-            echo "🔌 VPN attempt $ATTEMPT/80"
+            echo "[$(date -u +%H:%M:%S)] VPN attempt $ATTEMPT/80 (waited $(( $(date +%s)-T0 ))s so far)"
             sudo pkill -x openvpn 2>/dev/null || true
             sleep 1
             sudo openvpn --config config.ovpn --verb 6 --log vpn.log --daemon --writepid vpn.pid
@@ -119,20 +161,21 @@ jobs:
                 break
               fi
               if grep -q "AUTH_FAILED" vpn.log 2>/dev/null; then
-                echo "⚠️ AUTH_FAILED (session probably still held by the other instance)"
+                AUTH_FAILS=$((AUTH_FAILS+1))
+                echo "AUTH_FAILED #$AUTH_FAILS (session probably still held by the other instance)"
                 break
               fi
               sleep 1
             done
             if [ "$CONNECTED" = "1" ]; then
-              echo "✅ tun0 appeared on attempt $ATTEMPT"
+              echo "[$(date -u +%H:%M:%S)] tun0 appeared on attempt $ATTEMPT after $(( $(date +%s)-T0 ))s ($AUTH_FAILS AUTH_FAILED before)"
               break
             fi
             sudo pkill -x openvpn 2>/dev/null || true
-            sleep 15
+            sleep 8
           done
           if [ "$CONNECTED" != "1" ]; then
-            echo "❌ VPN failed after 80 attempts"
+            echo "VPN failed after 80 attempts"
             tail -50 vpn.log || true
             exit 1
           fi
@@ -142,21 +185,21 @@ jobs:
         run: |
           set -Eeuo pipefail
           ip addr show tun0
-          ip route | head -10
+          echo "--- routes ---"; ip route | head -10
           echo "--- vpn.log tail ---"
           tail -15 vpn.log || true
           OK=0
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --interface tun0 --max-time 8 https://fapi.binance.com/fapi/v1/ping || true)
-            echo "Binance via tun0 $i/30: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then OK=1; break; fi
+            OUT=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --interface tun0 --max-time 8 https://fapi.binance.com/fapi/v1/ping || true)
+            echo "Binance via tun0 $i/30: ${OUT:-000 0}"
+            if [ "${OUT%% *}" = "200" ]; then OK=1; break; fi
             sleep 2
           done
           if [ "$OK" != "1" ]; then
             ./startup_fail.sh "Binance not reachable through tun0"
             exit 1
           fi
-          echo "✅ VPN data path to Binance verified"
+          echo "VPN data path to Binance verified"
 
       - name: Check Exit IP Gate
         run: |
@@ -167,76 +210,107 @@ jobs:
             if [[ "$EXIT_IP" =~ ^[0-9.]+$ ]]; then break; fi
             EXIT_IP=""
           done
-          echo "🌍 Exit IP: ${EXIT_IP:-UNKNOWN}"
+          echo "Exit IP (via tun0): ${EXIT_IP:-UNKNOWN} | before VPN: $PRE_IP"
           if [ -z "$EXIT_IP" ]; then
-            echo "⚠️ Could not determine exit IP (non-fatal)"
+            echo "Could not determine exit IP (non-fatal)"
           elif [ -n "${EXPECTED_EXIT_IP:-}" ] && [ "$EXIT_IP" != "$EXPECTED_EXIT_IP" ]; then
-            echo "❌ Exit IP mismatch (expected $EXPECTED_EXIT_IP)"
+            echo "Exit IP mismatch (expected $EXPECTED_EXIT_IP)"
+            ./startup_fail.sh "exit IP mismatch"
             exit 1
           else
-            echo "✅ Exit IP OK"
+            echo "Exit IP OK"
+            echo "EXIT_IP=$EXIT_IP" >> "$GITHUB_ENV"
           fi
 
       - name: Start Receiver
         run: |
           set -Eeuo pipefail
-          trap 'echo "❌ Error on line $LINENO"' ERR
+          trap 'echo "Error on line $LINENO"' ERR
           PY=/usr/bin/python3
           if [ ! -x "$PY" ]; then PY=$(command -v python3); fi
           "$PY" --version
           echo "--- receiver server model ---"
           grep -nE "ThreadingHTTPServer|ThreadingMixIn|HTTPServer|socketserver" receiver.py || echo "(no match)"
-
           READY=0
           RECEIVER_PID=""
           for ATTEMPT in 1 2 3; do
-            echo "--- Starting receiver.py (attempt $ATTEMPT/3) on port 8081 ---"
+            echo "--- [$(date -u +%H:%M:%S)] Starting receiver.py (attempt $ATTEMPT/3) on port 8081 ---"
             pkill -f "python.*receiver.py" 2>/dev/null || true
             sleep 1
             nohup "$PY" -u receiver.py > receiver.log 2>&1 &
             RECEIVER_PID=$!
-            echo "✅ Receiver PID: $RECEIVER_PID"
+            echo "Receiver PID: $RECEIVER_PID"
             for i in $(seq 1 6); do
               sleep 2
               if ! kill -0 "$RECEIVER_PID" 2>/dev/null; then
-                echo "❌ receiver process exited"
+                echo "receiver process exited"
                 break
               fi
-              CODE=$(curl -s -o /dev/null -w "%{http_code}" --noproxy '*' --max-time 8 http://127.0.0.1:8081/fapi/v1/ping || true)
-              echo "Receiver check $i/6: HTTP $CODE"
-              if [ "$CODE" = "200" ]; then READY=1; break; fi
+              OUT=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --noproxy '*' --max-time 8 http://127.0.0.1:8081/fapi/v1/ping || true)
+              echo "Receiver check $i/6: ${OUT:-000 0}"
+              if [ "${OUT%% *}" = "200" ]; then READY=1; break; fi
             done
             if [ "$READY" = "1" ]; then break; fi
-
-            echo "⚠️ Attempt $ATTEMPT failed - diagnostics:"
+            echo "Attempt $ATTEMPT failed - diagnostics:"
             echo "--- receiver.log ---"; cat receiver.log || true
             echo "--- listening sockets ---"; ss -ltnp | grep 8081 || true
             if timeout 3 bash -c '</dev/tcp/127.0.0.1/8081' 2>/dev/null; then
-              echo "TCP connect to 8081: accepted (receiver is up, upstream/HTTP is slow)"
+              echo "TCP connect to 8081: accepted"
             else
               echo "TCP connect to 8081: NOT accepted"
             fi
-            DIRECT=$(curl -s -o /dev/null -w "%{http_code}" --interface tun0 --max-time 10 https://fapi.binance.com/fapi/v1/ping || true)
-            echo "Direct tun0 -> Binance: HTTP $DIRECT"
+            DIRECT=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --interface tun0 --max-time 10 https://fapi.binance.com/fapi/v1/ping || true)
+            echo "Direct tun0 -> Binance: ${DIRECT:-000 0}"
           done
-
           if [ "$READY" != "1" ]; then
-            echo "❌ Receiver not responding"
+            echo "Receiver not responding"
             ./startup_fail.sh "receiver not responding"
             exit 1
           fi
           echo "RECEIVER_PID=$RECEIVER_PID" >> "$GITHUB_ENV"
           echo "--- Receiver Log ---"; head -5 receiver.log || true
-          echo "✅ Receiver ready"
+          echo "Receiver ready"
+      - name: Route cloudflared outside VPN
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "Error on line $LINENO"' ERR
+          echo "Original gateway: $ORIG_GW via $ORIG_DEV"
+          echo "IP before VPN: $PRE_IP | VPN exit IP: ${EXIT_IP:-UNKNOWN}"
+          CF_MODE=vpn
+          sudo useradd -r -M -s /usr/sbin/nologin cfuser 2>/dev/null || true
+          CF_UID=$(id -u cfuser)
+          echo "cfuser uid: $CF_UID"
+          sudo install -m 755 cloudflared /usr/local/bin/cfd
+          sudo ip route replace default via "$ORIG_GW" dev "$ORIG_DEV" onlink table 100
+          sudo ip rule del uidrange $CF_UID-$CF_UID lookup 100 2>/dev/null || true
+          sudo ip rule add uidrange $CF_UID-$CF_UID lookup 100 priority 100
+          echo "--- ip rule ---"; ip rule show
+          echo "--- route table 100 ---"; ip route show table 100
+          CF_IP=""
+          for U in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+            CF_IP=$(sudo -u cfuser curl -s -m 8 "$U" | tr -d '[:space:]' || true)
+            if [[ "$CF_IP" =~ ^[0-9.]+$ ]]; then break; fi
+            CF_IP=""
+          done
+          echo "cloudflared egress IP: ${CF_IP:-UNKNOWN}"
+          if [ -n "$CF_IP" ] && [ "$CF_IP" != "${EXIT_IP:-}" ]; then
+            CF_MODE=isolated
+            echo "cloudflared is OUTSIDE the VPN (egress $CF_IP != VPN exit ${EXIT_IP:-?})"
+          else
+            echo "isolation failed -> falling back: cloudflared will run THROUGH the VPN"
+            sudo ip rule del uidrange $CF_UID-$CF_UID lookup 100 2>/dev/null || true
+          fi
+          echo "CF_MODE=$CF_MODE" >> "$GITHUB_ENV"
+          echo "CF_MODE=$CF_MODE"
 
       - name: Start Cloudflared Quick Tunnel and Register
         run: |
           set -Eeuo pipefail
-          trap 'echo "❌ Error on line $LINENO"' ERR
-          nohup ./cloudflared tunnel --url http://127.0.0.1:8081 --protocol http2 --no-autoupdate > cloudflared.log 2>&1 &
-          CF_PID=$!
-          echo "✅ cloudflared PID: $CF_PID"
-
+          trap 'echo "Error on line $LINENO"' ERR
+          echo "[$(date -u +%H:%M:%S)] starting cloudflared (mode: $CF_MODE)"
+          ./start_cf.sh
+          sleep 1
+          pgrep -af "[t]unnel --url http://127.0.0.1:8081" || echo "cloudflared process not visible yet"
           URL=""
           for i in $(seq 1 40); do
             URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | grep -v '^https://api\.' | head -1 || true)
@@ -244,25 +318,23 @@ jobs:
             sleep 2
           done
           if [ -z "$URL" ]; then
-            echo "❌ No tunnel URL"; cat cloudflared.log || true
+            echo "No tunnel URL"; cat cloudflared.log || true
             ./startup_fail.sh "no quick tunnel URL"
             exit 1
           fi
-          echo "🔗 Tunnel URL: $URL"
-
+          echo "Tunnel URL: $URL"
           OK=0
           for i in $(seq 1 40); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL/fapi/v1/ping" || true)
-            echo "Tunnel precheck $i/40: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then OK=1; break; fi
+            OUT=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --max-time 10 "$URL/fapi/v1/ping" || true)
+            echo "Tunnel precheck $i/40: ${OUT:-000 0}"
+            if [ "${OUT%% *}" = "200" ]; then OK=1; break; fi
             sleep 3
           done
           if [ "$OK" != "1" ]; then
-            echo "❌ Tunnel precheck failed"; tail -30 cloudflared.log || true
+            echo "Tunnel precheck failed"; tail -30 cloudflared.log || true
             ./startup_fail.sh "tunnel precheck failed"
             exit 1
           fi
-
           REG=0
           for i in 1 2 3 4 5; do
             R=$(curl -s -m 15 -X POST "$WORKER_URL/__register" \
@@ -276,110 +348,139 @@ jobs:
             ./startup_fail.sh "registration failed"
             exit 1
           fi
-
           echo "TUNNEL_URL=$URL" >> "$GITHUB_ENV"
-          echo "CF_PID=$CF_PID" >> "$GITHUB_ENV"
-          echo "✅ Registered as $INSTANCE"
+          echo "[$(date -u +%H:%M:%S)] Registered as $INSTANCE -> $URL"
+          echo "Worker status:"
+          curl -s -m 10 "$WORKER_URL/__status" -H "X-Secret: $REGISTER_SECRET" || true
+          echo
 
       - name: Run Task and Ping Pong Loop
         run: |
           set -Eeuo pipefail
-          trap 'echo "⚠️ Unexpected error at line $LINENO (exit $?)"' ERR
-
+          trap 'echo "Unexpected error at line $LINENO (exit $?)"' ERR
           GH_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches"
           LOCAL_URL="http://127.0.0.1:8081/fapi/v1/ping"
           CHAIN_URL="https://curly-field-a765.abdo-xchg-61892.workers.dev/fapi/v1/ping"
+          CF_PATTERN="[t]unnel --url http://127.0.0.1:8081"
           TRIGGERED=0
           LOCAL_FAILS=0
           TUN_FAILS=0
           CHAIN_FAILS=0
-
+          TUNNEL_RESTARTS=0
+          REREGISTERS=0
+          BAD_MINUTES=0
           probe() {
             local out
             out=$(curl -s -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 15 \
               -w "%{http_code} %{time_total}" "$1" 2>/dev/null || true)
             echo "${out:-000 0}"
           }
-
+          cf_alive() { pgrep -f "$CF_PATTERN" >/dev/null 2>&1; }
+          cf_stop()  { sudo pkill -f "$CF_PATTERN" 2>/dev/null || true; }
+          tun_kb() {
+            local rx tx
+            rx=$(cat /sys/class/net/tun0/statistics/rx_bytes 2>/dev/null || echo 0)
+            tx=$(cat /sys/class/net/tun0/statistics/tx_bytes 2>/dev/null || echo 0)
+            echo "rx=$((rx/1024))KB tx=$((tx/1024))KB"
+          }
+          dump_diag() {
+            echo "   diagnostics ($(date -u +%H:%M:%S))"
+            echo "   openvpn: $(pgrep -x openvpn >/dev/null && echo alive || echo DEAD) | receiver: $(kill -0 "$RECEIVER_PID" 2>/dev/null && echo alive || echo DEAD) | cloudflared: $(cf_alive && echo alive || echo DEAD)"
+            echo "   load: $(cut -d' ' -f1-3 /proc/loadavg) | tun0: $(tun_kb)"
+            echo "   cloudflared.log (last 6):"; tail -6 cloudflared.log 2>/dev/null | sed 's/^/     /' || true
+            echo "   receiver.log (last 4):"; tail -4 receiver.log 2>/dev/null | sed 's/^/     /' || true
+            echo "   vpn.log (last 4):"; tail -4 vpn.log 2>/dev/null | sed 's/^/     /' || true
+          }
+          status_block() {
+            local vip cip
+            vip=$(curl -s --interface tun0 -m 8 https://api.ipify.org | tr -d '[:space:]' || true)
+            if [ "$CF_MODE" = "isolated" ]; then
+              cip=$(sudo -u cfuser curl -s -m 8 https://api.ipify.org | tr -d '[:space:]' || true)
+            else
+              cip="(runs through VPN)"
+            fi
+            echo "   status ($(date -u +%H:%M:%S))"
+            echo "   VPN exit IP now: ${vip:-UNKNOWN} | cloudflared egress: ${cip:-UNKNOWN} | mode: $CF_MODE"
+            echo "   tunnel: $TUNNEL_URL"
+            echo "   tunnel restarts: $TUNNEL_RESTARTS | re-registers: $REREGISTERS | bad minutes: $BAD_MINUTES"
+            echo "   worker: $(curl -s -m 10 "$WORKER_URL/__status" -H "X-Secret: $REGISTER_SECRET" || echo unreachable)"
+          }
           register_now() {
             local r
             r=$(curl -s -m 15 -X POST "$WORKER_URL/__register" \
               -H "X-Secret: $REGISTER_SECRET" -H "Content-Type: application/json" \
               -d "{\"instance\":\"$INSTANCE\",\"url\":\"$TUNNEL_URL\"}" || true)
             if [ "$r" = "ok" ]; then return 0; fi
-            echo "⚠️ register failed: ${r:-<empty>}"
+            echo "register failed: ${r:-<empty>}"
             return 1
           }
-
           deregister() {
             curl -s -m 10 -X POST "$WORKER_URL/__deregister" \
               -H "X-Secret: $REGISTER_SECRET" -H "Content-Type: application/json" \
               -d "{\"instance\":\"$INSTANCE\",\"url\":\"$TUNNEL_URL\"}" >/dev/null || true
           }
-
           trigger_other() {
             local code i
             for i in 1 2 3; do
               code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 -X POST \
                 -H "Authorization: token $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
-                "$GH_API" -d "{\"event_type\":\"$OTHER_EVENT\"}" || true)
-              echo "🔔 Trigger $OTHER_EVENT -> HTTP $code"
+                "$GH_API" -d "{\"event_type\":\"$OTHER_EVENT\",\"client_payload\":{\"duration\":\"$DURATION_MINUTES\",\"trigger\":\"$TRIGGER_MINUTE\"}}" || true)
+              echo "[$(date -u +%H:%M:%S)] Trigger $OTHER_EVENT -> HTTP $code"
               if [ "$code" = "204" ]; then TRIGGERED=1; return 0; fi
               sleep 3
             done
             return 1
           }
-
           shutdown_instance() {
-            echo "🛑 Shutting down instance $INSTANCE"
+            echo "[$(date -u +%H:%M:%S)] Shutting down instance $INSTANCE"
             deregister
-            kill "$CF_PID" "$RECEIVER_PID" 2>/dev/null || true
+            cf_stop
+            kill "$RECEIVER_PID" 2>/dev/null || true
             sudo pkill -x openvpn 2>/dev/null || true
             sleep 2
+            echo "[$(date -u +%H:%M:%S)] VPN session released (other instance can log in now)"
           }
-
           fail_over() {
-            echo "🚨 FAIL-OVER: $1"
+            echo "[$(date -u +%H:%M:%S)] FAIL-OVER: $1"
+            dump_diag
             if (( TRIGGERED == 0 )); then trigger_other || true; fi
             shutdown_instance
             exit 1
           }
-
           restart_tunnel() {
-            echo "🔄 Restarting cloudflared only (VPN untouched)..."
-            kill "$CF_PID" 2>/dev/null || true
-            pkill -x cloudflared 2>/dev/null || true
+            echo "[$(date -u +%H:%M:%S)] Restarting cloudflared only (VPN untouched, mode $CF_MODE)..."
+            TUNNEL_RESTARTS=$((TUNNEL_RESTARTS+1))
+            cf_stop
             sleep 2
-            nohup ./cloudflared tunnel --url http://127.0.0.1:8081 --protocol http2 --no-autoupdate > cloudflared.log 2>&1 &
-            CF_PID=$!
-            local url="" code i ok=0
+            ./start_cf.sh
+            local url="" out code i ok=0
             for i in $(seq 1 30); do
               url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | grep -v '^https://api\.' | head -1 || true)
               if [ -n "$url" ]; then break; fi
               sleep 2
             done
-            if [ -z "$url" ]; then echo "❌ no new tunnel URL"; return 1; fi
-            echo "🔗 New tunnel URL: $url"
+            if [ -z "$url" ]; then echo "no new tunnel URL"; tail -15 cloudflared.log || true; return 1; fi
+            echo "New tunnel URL: $url"
             for i in $(seq 1 30); do
-              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$url/fapi/v1/ping" || true)
+              out=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" --max-time 10 "$url/fapi/v1/ping" || true)
+              code="${out%% *}"
+              echo "   precheck $i/30: ${out:-000 0}"
               if [ "$code" = "200" ]; then ok=1; break; fi
               sleep 3
             done
-            if [ "$ok" != "1" ]; then echo "❌ new tunnel precheck failed"; return 1; fi
+            if [ "$ok" != "1" ]; then echo "new tunnel precheck failed"; return 1; fi
             TUNNEL_URL="$url"
             echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
-            echo "CF_PID=$CF_PID" >> "$GITHUB_ENV"
             if ! register_now; then return 1; fi
-            echo "✅ Tunnel restarted and re-registered"
+            echo "[$(date -u +%H:%M:%S)] Tunnel restarted and re-registered"
             return 0
           }
-
           START=$(date +%s)
           NEXT=$START
           LAST_HB=$START
-          echo "🚀 Instance $INSTANCE loop: ${DURATION_MINUTES} min, handoff at minute ${TRIGGER_MINUTE}"
-
+          echo "[$(date -u +%H:%M:%S)] Instance $INSTANCE loop: ${DURATION_MINUTES} min, handoff at minute ${TRIGGER_MINUTE}, cloudflared mode: $CF_MODE"
+          status_block
           while true; do
             NEXT=$((NEXT+60))
             NOW=$(date +%s)
@@ -387,37 +488,42 @@ jobs:
             NOW=$(date +%s)
             MIN=$(( (NOW-START)/60 ))
             if (( MIN >= DURATION_MINUTES )); then break; fi
-
-            # ---- process liveness ----
             if ! pgrep -x openvpn >/dev/null || ! ip addr show tun0 >/dev/null 2>&1; then
               fail_over "VPN is down"
             fi
             if ! kill -0 "$RECEIVER_PID" 2>/dev/null; then
               fail_over "receiver process is dead"
             fi
-            if ! kill -0 "$CF_PID" 2>/dev/null; then
-              echo "⚠️ cloudflared process is dead"
+            if ! cf_alive; then
+              echo "cloudflared process is dead"
+              dump_diag
               if restart_tunnel; then TUN_FAILS=0; else fail_over "cloudflared restart failed"; fi
             fi
-
-            # ---- per-hop probes ----
             read -r L_CODE L_TIME <<< "$(probe "$LOCAL_URL")"
-            read -r T_CODE T_TIME <<< "$(probe "$TUNNEL_URL/fapi/v1/ping")"
             read -r C_CODE C_TIME <<< "$(probe "$CHAIN_URL")"
-            echo "⏱️ [$(date -u +%H:%M:%S)] Min $MIN/$DURATION_MINUTES | local: $L_CODE (${L_TIME}s) | tunnel: $T_CODE (${T_TIME}s) | chain: $C_CODE (${C_TIME}s)"
-
-            # ---- decisions ----
+            if [ "$C_CODE" != "200" ] || (( MIN % 5 == 0 )); then
+              read -r T_CODE T_TIME <<< "$(probe "$TUNNEL_URL/fapi/v1/ping")"
+            else
+              T_CODE="skip"; T_TIME="-"
+            fi
+            echo "[$(date -u +%H:%M:%S)] Min $MIN/$DURATION_MINUTES | local: $L_CODE (${L_TIME}s) | tunnel: $T_CODE (${T_TIME}s) | chain: $C_CODE (${C_TIME}s) | tun0 $(tun_kb)"
+            if [ "$L_CODE" != "200" ] || [ "$C_CODE" != "200" ] || { [ "$T_CODE" != "skip" ] && [ "$T_CODE" != "200" ]; }; then
+              BAD_MINUTES=$((BAD_MINUTES+1))
+              dump_diag
+            fi
             if [ "$L_CODE" != "200" ]; then
               LOCAL_FAILS=$((LOCAL_FAILS+1)); TUN_FAILS=0; CHAIN_FAILS=0
-              echo "⚠️ local path failing ($LOCAL_FAILS/3)"
+              echo "local path failing ($LOCAL_FAILS/3)"
               if (( LOCAL_FAILS >= 3 )); then
                 fail_over "local path (receiver->VPN->Binance) failing 3 min in a row"
               fi
             else
               LOCAL_FAILS=0
-              if [ "$T_CODE" != "200" ]; then
+              if [ "$T_CODE" = "skip" ]; then
+                TUN_FAILS=0; CHAIN_FAILS=0
+              elif [ "$T_CODE" != "200" ]; then
                 TUN_FAILS=$((TUN_FAILS+1)); CHAIN_FAILS=0
-                echo "⚠️ tunnel failing while local is OK ($TUN_FAILS/2)"
+                echo "tunnel failing while local is OK ($TUN_FAILS/2)"
                 if (( TUN_FAILS >= 2 )); then
                   if restart_tunnel; then TUN_FAILS=0; else fail_over "tunnel restart failed"; fi
                 fi
@@ -425,32 +531,30 @@ jobs:
                 TUN_FAILS=0
                 if [ "$C_CODE" != "200" ]; then
                   CHAIN_FAILS=$((CHAIN_FAILS+1))
-                  echo "⚠️ chain failing while local+tunnel OK -> re-registering"
+                  REREGISTERS=$((REREGISTERS+1))
+                  echo "chain failing while local+tunnel OK -> re-registering (#$REREGISTERS)"
                   register_now || true
                 else
                   CHAIN_FAILS=0
                 fi
               fi
             fi
-
-            # ---- heartbeat ----
             NOW=$(date +%s)
             if (( NOW - LAST_HB >= HEARTBEAT_EVERY * 60 )); then
-              if register_now; then echo "💓 heartbeat ok"; fi
+              if register_now; then echo "heartbeat ok"; fi
+              status_block
               LAST_HB=$NOW
             fi
-
-            # ---- handoff ----
             if (( MIN >= TRIGGER_MINUTE )) && (( TRIGGERED == 0 )); then
-              echo "🔁 Handoff: triggering $OTHER_EVENT"
+              echo "[$(date -u +%H:%M:%S)] Handoff: triggering $OTHER_EVENT"
               trigger_other || true
             fi
           done
-
-          echo "⏰ Duration reached"
+          echo "[$(date -u +%H:%M:%S)] Duration reached"
+          status_block
           if (( TRIGGERED == 0 )); then trigger_other || true; fi
           shutdown_instance
-          echo "✅ Instance $INSTANCE finished cleanly"
+          echo "[$(date -u +%H:%M:%S)] Instance $INSTANCE finished cleanly | tunnel restarts: $TUNNEL_RESTARTS | re-registers: $REREGISTERS | bad minutes: $BAD_MINUTES"
 
       - name: Deregister (safety)
         if: always()
@@ -460,4 +564,4 @@ jobs:
               -H "X-Secret: $REGISTER_SECRET" -H "Content-Type: application/json" \
               -d "{\"instance\":\"$INSTANCE\",\"url\":\"$TUNNEL_URL\"}" || true
           fi
-          echo "🧹 done"
+          echo "[$(date -u +%H:%M:%S)] done"
