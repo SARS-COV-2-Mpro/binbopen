@@ -8,332 +8,542 @@ on:
 jobs:
   run-instance-a:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-
+    timeout-minutes: 150
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Download cloudflared (before VPN)
         run: |
           set -Eeuo pipefail
-          trap 'rc=$?; echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Download cloudflared"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $rc"; echo "Timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"' ERR
-          curl -fsSL --retry 5 --retry-delay 3 -o cloudflared \
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Download cloudflared"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "==============================="
+          echo "--- Downloading cloudflared binary (before VPN, fast network) ---"
+          curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 120 \
+            -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          ./cloudflared --version
-          echo "✅ cloudflared downloaded"
+          echo "✅ cloudflared binary downloaded"
+
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+
+          echo "--- Verifying cloudflared binary ---"
+          cloudflared --version || { echo "❌ cloudflared binary not working"; exit 1; }
+          echo "✅ cloudflared installed and verified"
+          echo "==============================="
 
       - name: Validate Required Secrets
         run: |
           set -Eeuo pipefail
-          missing=0
-          [ -n "${{ secrets.VPN_CONFIG }}" ]      || { echo "❌ VPN_CONFIG missing"; missing=1; }
-          [ -n "${{ secrets.VPN_USERNAME }}" ]    || { echo "❌ VPN_USERNAME missing"; missing=1; }
-          [ -n "${{ secrets.VPN_PASSWORD }}" ]    || { echo "❌ VPN_PASSWORD missing"; missing=1; }
-          [ -n "${{ secrets.GH_TOKEN }}" ]        || { echo "❌ GH_TOKEN missing"; missing=1; }
-          [ -n "${{ secrets.WORKER_URL }}" ]      || { echo "❌ WORKER_URL missing"; missing=1; }
-          [ -n "${{ secrets.REGISTER_SECRET }}" ] || { echo "❌ REGISTER_SECRET missing"; missing=1; }
-          if [ "$missing" -ne 0 ]; then exit 1; fi
-          echo "✅ All required secrets are set"
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Validate Required Secrets"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "==============================="
+          echo "--- Validating required GitHub Secrets are present ---"
+          echo "==============================="
+
+          MISSING=0
+
+          check_secret() {
+            NAME="$1"
+            VALUE="$2"
+            if [ -z "$VALUE" ]; then
+              echo "❌ MISSING: $NAME is empty or not set"
+              MISSING=1
+            else
+              echo "✅ OK: $NAME is set (length: ${#VALUE} chars)"
+            fi
+          }
+
+          check_secret "VPN_USERNAME" "${{ secrets.VPN_USERNAME }}"
+          check_secret "VPN_PASSWORD" "${{ secrets.VPN_PASSWORD }}"
+          check_secret "VPN_CONFIG" "${{ secrets.VPN_CONFIG }}"
+          check_secret "GH_TOKEN" "${{ secrets.GH_TOKEN }}"
+          check_secret "WORKER_URL" "${{ secrets.WORKER_URL }}"
+          check_secret "REGISTER_SECRET" "${{ secrets.REGISTER_SECRET }}"
+
+          if [ "$MISSING" -eq 1 ]; then
+            echo "==============================="
+            echo "❌ One or more required secrets are missing. Aborting."
+            echo "==============================="
+            exit 1
+          fi
+
+          echo "==============================="
+          echo "✅ All required secrets are present."
+          echo "==============================="
 
       - name: Install OpenVPN
         run: |
           set -Eeuo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openvpn
-          openvpn --version | head -n 1
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Install OpenVPN"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "==============================="
+          echo "--- Updating apt package lists ---"
+          if ! sudo apt-get update; then
+            echo "❌ apt-get update failed"
+            exit 1
+          fi
+          echo "✅ apt-get update succeeded"
+
+          echo "--- Installing openvpn package ---"
+          if ! sudo apt-get install -y openvpn; then
+            echo "❌ apt-get install openvpn failed"
+            exit 1
+          fi
+          echo "✅ openvpn package installed"
+
+          echo "--- OpenVPN Version ---"
+          openvpn --version
+          echo "==============================="
 
       - name: Setup VPN Credentials
         run: |
           set -Eeuo pipefail
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Setup VPN Credentials"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "--- Creating credentials file ---"
           echo "${{ secrets.VPN_USERNAME }}" > pass.txt
           echo "${{ secrets.VPN_PASSWORD }}" >> pass.txt
           chmod 600 pass.txt
+
+          if [ ! -s pass.txt ]; then
+            echo "❌ pass.txt is empty after creation — VPN_USERNAME/VPN_PASSWORD secrets may be blank"
+            exit 1
+          fi
+          echo "✅ pass.txt created ($(wc -l < pass.txt) lines)"
+
+          echo "--- Writing VPN config ---"
           echo "${{ secrets.VPN_CONFIG }}" > config.ovpn
-          sed -i 's/\r$//' config.ovpn
-          sed -i '/^persist-key/d;/^persist-tun/d;/^auth-user-pass/d' config.ovpn
+
+          if [ ! -s config.ovpn ]; then
+            echo "❌ config.ovpn is empty after creation — VPN_CONFIG secret may be blank"
+            exit 1
+          fi
+          echo "✅ config.ovpn created ($(wc -l < config.ovpn) lines)"
+
+          echo "--- Removing deprecated options ---"
+          sed -i '/persist-key/d' config.ovpn
+          sed -i '/persist-tun/d' config.ovpn
+          echo "✅ Removed persist-key and persist-tun"
+
+          echo "--- Fixing auth-user-pass line ---"
+          sed -i '/auth-user-pass/d' config.ovpn
           echo "auth-user-pass pass.txt" >> config.ovpn
+          echo "✅ auth-user-pass fixed"
+
+          echo "--- Fixing cipher negotiation (OpenVPN 2.6+ requirement) ---"
           echo "data-ciphers AES-128-CBC" >> config.ovpn
           echo "data-ciphers-fallback AES-128-CBC" >> config.ovpn
-          echo "✅ VPN config prepared"
+          echo "✅ data-ciphers added"
+
+          echo "==============================="
+          echo "--- Final config.ovpn content ---"
+          cat config.ovpn
+          echo "==============================="
 
       - name: Check IP Before VPN
         run: |
           set -Eeuo pipefail
-          echo "Exit IP (Before VPN):"
-          curl -s --max-time 15 https://ifconfig.me || echo "UNKNOWN"
-          echo ""
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Check IP Before VPN"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "==============================="
+          echo "GitHub Runner IP (Before VPN):"
+          set +e
+          BEFORE_IP=$(curl -s --connect-timeout 10 --max-time 20 https://ifconfig.me 2>/tmp/before_ip_err.log)
+          BEFORE_EXIT=$?
+          set -e
+          if [ $BEFORE_EXIT -ne 0 ]; then
+            echo "⚠️ ifconfig.me unreachable (non-fatal) — curl exit code $BEFORE_EXIT"
+            echo "⚠️ curl stderr: $(cat /tmp/before_ip_err.log 2>/dev/null)"
+          else
+            echo "$BEFORE_IP"
+          fi
+          echo "==============================="
 
       - name: Start VPN
         run: |
           set -Eeuo pipefail
-          trap 'rc=$?; echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Start VPN"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $rc"; echo "Timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"' ERR
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Start VPN"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
 
           echo "--- Enabling TUN device ---"
-          sudo mkdir -p /dev/net
-          [ -c /dev/net/tun ] || sudo mknod /dev/net/tun c 10 200
-          sudo chmod 666 /dev/net/tun
-          ls -l /dev/net/tun
+          sudo modprobe tun
+          ls /dev/net/tun
           echo "✅ TUN device is available"
 
-          MAX_ATTEMPTS=80
-          ATTEMPT_WAIT=45
-          PAUSE_BETWEEN=15
-          VPN_OK=0
+          echo "--- Creating log file with open permissions ---"
+          sudo touch /tmp/vpn.log
+          sudo chmod 777 /tmp/vpn.log
+          echo "✅ Log file created"
 
-          for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
-            echo "==============================="
-            echo "🔌 VPN attempt $ATTEMPT/$MAX_ATTEMPTS at $(date +%H:%M:%S)"
-            sudo pkill -KILL openvpn 2>/dev/null || true
-            : > /tmp/vpn.log
-            sudo nohup openvpn --config config.ovpn --verb 6 > /tmp/vpn.log 2>&1 &
+          echo "--- Starting OpenVPN ---"
+          sudo openvpn \
+            --config config.ovpn \
+            --auth-user-pass pass.txt \
+            --verb 6 \
+            --log /tmp/vpn.log &
 
-            for S in $(seq 1 $ATTEMPT_WAIT); do
-              sleep 1
-              if ! pgrep -x openvpn > /dev/null; then
-                echo "⚠️ OpenVPN exited at second $S"
-                break
-              fi
-              if ip link show tun0 > /dev/null 2>&1 && grep -q "Initialization Sequence Completed" /tmp/vpn.log; then
-                echo "✅ tun0 appeared at second $S"
-                VPN_OK=1
-                break
-              fi
-            done
+          VPN_PID=$!
+          echo "✅ OpenVPN PID: $VPN_PID"
 
-            if [ "$VPN_OK" -eq 1 ]; then
-              echo "==============================="
-              echo "--- VPN Log (last 40 lines) ---"
-              tail -n 40 /tmp/vpn.log
-              echo "==============================="
-              echo "✅ OpenVPN process is RUNNING"
+          echo "--- Waiting up to 60 seconds for tun0 to appear ---"
+          TUN_UP=0
+          for i in {1..60}; do
+            sleep 1
+            if ip link show tun0 > /dev/null 2>&1; then
+              echo "✅ tun0 appeared at second $i"
+              TUN_UP=1
               break
             fi
-
-            echo "--- Last VPN log lines ---"
-            tail -n 8 /tmp/vpn.log || true
-            sudo pkill -KILL openvpn 2>/dev/null || true
-            echo "⏳ Not connected (session probably still held). Retrying in ${PAUSE_BETWEEN}s..."
-            sleep $PAUSE_BETWEEN
+            echo "⏳ Second $i - waiting for tun0..."
           done
 
-          if [ "$VPN_OK" -ne 1 ]; then
-            echo "❌ VPN did not connect after $MAX_ATTEMPTS attempts"
+          echo "==============================="
+          echo "--- Full VPN Log ---"
+          sudo cat /tmp/vpn.log
+          echo "==============================="
+
+          if [ "$TUN_UP" -eq 0 ]; then
+            echo "❌ tun0 NEVER appeared within 60 seconds - VPN failed to connect"
+            echo "--- Process list (openvpn) ---"
+            ps aux | grep openvpn || true
+            exit 1
+          fi
+          echo "✅ tun0 is UP"
+
+          echo "--- Checking OpenVPN process ---"
+          if pgrep openvpn > /dev/null; then
+            echo "✅ OpenVPN process is RUNNING"
+          else
+            echo "❌ OpenVPN process DIED after tun0 came up (unusual)"
             exit 1
           fi
 
       - name: Verify VPN Connection
         run: |
           set -Eeuo pipefail
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Verify VPN Connection"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "==============================="
           echo "Exit IP (After VPN):"
-          curl -s --max-time 15 https://ifconfig.me || echo "UNKNOWN"
+          set +e
+          CURRENT_IP=$(curl -s --connect-timeout 10 --max-time 20 https://ifconfig.me 2>/tmp/after_ip_err.log)
+          IP_EXIT=$?
+          set -e
+          if [ $IP_EXIT -ne 0 ]; then
+            echo "⚠️ ifconfig.me check failed — curl exit code $IP_EXIT: $(cat /tmp/after_ip_err.log 2>/dev/null)"
+            CURRENT_IP="UNKNOWN"
+          else
+            echo "$CURRENT_IP"
+          fi
           echo ""
+
+          echo "==============================="
+          echo "Location Details:"
+          if [ "$CURRENT_IP" != "UNKNOWN" ]; then
+            set +e
+            curl -s --connect-timeout 10 --max-time 20 https://ipinfo.io/$CURRENT_IP 2>/tmp/ipinfo_err.log
+            IPINFO_EXIT=$?
+            set -e
+            if [ $IPINFO_EXIT -ne 0 ]; then
+              echo "⚠️ ipinfo.io unreachable (non-fatal) — curl exit code $IPINFO_EXIT: $(cat /tmp/ipinfo_err.log 2>/dev/null)"
+            fi
+          else
+            echo "⚠️ Skipping ipinfo.io lookup — IP unknown"
+          fi
+          echo ""
+
+          echo "==============================="
           echo "VPN Tunnel Interface (tun0):"
-          ip addr show tun0
-          echo "✅ tun0 is UP"
+          if ip addr show tun0 > /dev/null 2>&1; then
+            ip addr show tun0
+            echo "✅ tun0 is UP"
+          else
+            echo "❌ tun0 is NOT found"
+            exit 1
+          fi
+
+          echo "==============================="
           echo "Routing Table:"
           ip route
+          echo ""
+
+          echo "==============================="
+          echo "DNS Check:"
+          cat /etc/resolv.conf
+          echo ""
+
+          echo "==============================="
+          echo "--- Full VPN Log After Connection ---"
+          sudo cat /tmp/vpn.log
+          echo "==============================="
 
       - name: Check Exit IP Gate
         run: |
-          set -Eeuo pipefail
           EXPECTED="${{ secrets.EXPECTED_EXIT_IP }}"
           if [ -z "$EXPECTED" ]; then
-            echo "⚠️ EXPECTED_EXIT_IP not set — gate skipped."
-            exit 0
+            echo "⚠️ EXPECTED_EXIT_IP not set — gate skipped. Save the IP above as that secret after this run."
+          else
+            ACTUAL=$(curl -s --max-time 10 https://ifconfig.me || echo "UNKNOWN")
+            echo "Expected: $EXPECTED"
+            echo "Actual:   $ACTUAL"
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+              echo "❌ Exit IP mismatch"
+              exit 1
+            fi
+            echo "✅ Exit IP matches"
           fi
-          ACTUAL=$(curl -s --max-time 15 https://ifconfig.me || true)
-          echo "Expected: $EXPECTED | Actual: $ACTUAL"
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "❌ Exit IP mismatch"
-            exit 1
-          fi
-          echo "✅ Exit IP matches"
 
       - name: Start Receiver
         run: |
           set -Eeuo pipefail
-          trap 'rc=$?; echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Start Receiver"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $rc"; echo "Timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"' ERR
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Start Receiver"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "==============================="
+          echo "--- Checking python3 availability ---"
           python3 --version
+          echo "==============================="
+
           echo "--- Starting receiver.py (unbuffered) on port 8081 ---"
           nohup python3 -u receiver.py > /tmp/receiver.log 2>&1 &
-          RPID=$!
-          echo "RECEIVER_PID=$RPID" >> $GITHUB_ENV
-          echo "✅ Receiver PID: $RPID"
+          RECEIVER_PID=$!
+          echo "✅ Receiver PID: $RECEIVER_PID"
+
           sleep 5
-          ss -ltnp | grep 8081 || true
+
+          echo "--- Checking if port 8081 is listening ---"
+          sudo ss -tlnp | grep 8081 || echo "⚠️ Port 8081 not found in ss output (non-fatal, will verify with curl next)"
+
           echo "--- Receiver Log (first 5 seconds) ---"
-          cat /tmp/receiver.log || true
-          if ! kill -0 "$RPID" 2>/dev/null; then
-            echo "❌ receiver.py died"
+          cat /tmp/receiver.log
+          echo "==============================="
+
+          echo "--- Checking receiver process is alive ---"
+          if ! pgrep -f receiver.py > /dev/null; then
+            echo "❌ receiver.py process is NOT running"
+            cat /tmp/receiver.log
             exit 1
           fi
           echo "✅ receiver.py process is alive"
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:8081/ || true)
-          echo "HTTP response code: $CODE"
-          if [ "$CODE" = "000" ] || [ -z "$CODE" ]; then
-            echo "❌ Receiver not responding"
+
+          echo "--- Testing receiver with curl ---"
+          set +e
+          HTTP_CODE=$(curl -s -o /tmp/curl_response.txt -w "%{http_code}" --connect-timeout 5 --max-time 10 http://localhost:8081/ 2>/tmp/receiver_curl_err.log)
+          CURL_EXIT=$?
+          set -e
+
+          if [ $CURL_EXIT -ne 0 ]; then
+            echo "❌ curl itself failed (exit code $CURL_EXIT): $(cat /tmp/receiver_curl_err.log 2>/dev/null)"
+            cat /tmp/receiver.log
             exit 1
           fi
-          echo "✅ Receiver responded with HTTP $CODE (server is up)"
+
+          echo "HTTP response code: $HTTP_CODE"
+          echo "--- Response body ---"
+          cat /tmp/curl_response.txt 2>/dev/null || echo "(no response body captured)"
+          echo ""
+          echo "==============================="
+
+          if [ "$HTTP_CODE" == "000" ]; then
+            echo "❌ Receiver is NOT reachable at all (connection failed)"
+            cat /tmp/receiver.log
+            exit 1
+          else
+            echo "✅ Receiver responded with HTTP $HTTP_CODE (server is up)"
+          fi
 
       - name: Start Cloudflared Quick Tunnel and Register
         run: |
           set -Eeuo pipefail
-          trap 'rc=$?; echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Start Cloudflared Quick Tunnel and Register"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $rc"; echo "Timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"' ERR
-          INSTANCE="A"
-          ./cloudflared --version
+          trap 'echo "❌❌❌ FATAL ERROR ❌❌❌"; echo "Step: Start Cloudflared"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+          echo "==============================="
+          echo "--- Verifying cloudflared binary ---"
+          cloudflared --version || { echo "❌ cloudflared binary not working"; exit 1; }
+          echo "✅ cloudflared verified"
+
           echo "--- Starting cloudflared quick tunnel ---"
-          nohup ./cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8081 > /tmp/cloudflared.log 2>&1 &
-          CFPID=$!
-          echo "CF_PID=$CFPID" >> $GITHUB_ENV
-          echo "✅ cloudflared PID: $CFPID"
+          nohup cloudflared tunnel --no-autoupdate --protocol http2 --url http://localhost:8081 > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo "✅ cloudflared PID: $CF_PID"
 
           echo "--- Waiting for tunnel URL ---"
-          TUNNEL_URL=""
-          for i in $(seq 1 60); do
-            TUNNEL_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | grep -v '^https://api\.' | head -n 1 || true)
-            [ -n "$TUNNEL_URL" ] && break
-            if ! kill -0 "$CFPID" 2>/dev/null; then
-              echo "❌ cloudflared died"; tail -n 30 /tmp/cloudflared.log; exit 1
+          URL=""
+          for i in {1..30}; do
+            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log | grep -v '^https://api\.' | head -1 || true)
+            if [ -n "$URL" ]; then
+              echo "✅ Tunnel URL found: $URL"
+              break
             fi
             sleep 2
           done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ No tunnel URL found"; tail -n 30 /tmp/cloudflared.log; exit 1
+
+          if [ -z "$URL" ]; then
+            echo "❌ No tunnel URL found after 60 seconds"
+            cat /tmp/cloudflared.log
+            exit 1
           fi
-          echo "✅ Tunnel URL found: $TUNNEL_URL"
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+
+          echo "$URL" > /tmp/tunnel_url.txt
 
           echo "--- Verifying public chain (tunnel -> receiver -> VPN -> Binance) ---"
-          CHAIN_OK=0
-          for i in $(seq 1 12); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$TUNNEL_URL/fapi/v1/ping" || true)
-            echo "Public chain test $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then CHAIN_OK=1; break; fi
-            sleep 5
+          OK=0
+          for i in {1..20}; do
+            set +e
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 "$URL/fapi/v1/ping" 2>/tmp/chain_err.log)
+            CHAIN_EXIT=$?
+            set -e
+            echo "Public chain test $i: HTTP $CODE (curl exit $CHAIN_EXIT)"
+            if [ "$CODE" == "200" ]; then OK=1; break; fi
+            sleep 3
           done
-          if [ "$CHAIN_OK" -ne 1 ]; then echo "❌ Public chain failed"; exit 1; fi
+
+          if [ "$OK" != "1" ]; then
+            echo "❌ Public chain never returned 200"
+            echo "--- Cloudflared Log ---"
+            cat /tmp/cloudflared.log
+            echo "--- Receiver Log ---"
+            cat /tmp/receiver.log
+            exit 1
+          fi
           echo "✅ Public chain works"
 
           echo "--- Registering with tunnel-proxy ---"
-          REG_OK=0
-          for i in $(seq 1 5); do
-            RESP=$(curl -s --max-time 15 -X POST "${{ secrets.WORKER_URL }}/__register" \
+          RESP=""
+          for n in 1 2 3; do
+            set +e
+            RESP=$(curl -s --connect-timeout 10 --max-time 15 -X POST "${{ secrets.WORKER_URL }}/__register" \
               -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
               -H "Content-Type: application/json" \
-              -d "{\"instance\":\"$INSTANCE\",\"url\":\"$TUNNEL_URL\"}" || true)
-            echo "Register attempt $i: '$RESP'"
-            if [ "$RESP" = "ok" ]; then REG_OK=1; break; fi
+              -d "{\"instance\":\"A\",\"url\":\"$URL\"}" 2>/tmp/register_err.log)
+            REG_EXIT=$?
+            set -e
+            echo "Register attempt $n: '$RESP' (curl exit $REG_EXIT)"
+            if [ "$RESP" == "ok" ]; then break; fi
             sleep 3
           done
-          if [ "$REG_OK" -ne 1 ]; then echo "❌ Registration failed"; exit 1; fi
-          echo "✅ Registered with tunnel-proxy"
 
-      - name: Run Task and Ping Pong Loop
+          if [ "$RESP" != "ok" ]; then
+            echo "❌ Registration failed"
+            cat /tmp/register_err.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ Registered with tunnel-proxy"
+          echo "==============================="
+
+      - name: Run Task and Ping Pong Loop (Instance A)
         run: |
           set -Eeuo pipefail
-          trap 'rc=$?; echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Run Task and Ping Pong Loop"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $rc"; echo "Timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"' ERR
+          trap 'echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Run Task and Ping Pong Loop"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"; echo "Timestamp (UTC): $(date -u +"%Y-%m-%dT%H:%M:%SZ")"' ERR
 
-          INSTANCE="A"
-          OTHER_EVENT="trigger_a2"
-          DURATION_MINUTES=300
-          TRIGGER_MINUTE=295
-          HEARTBEAT_EVERY=5
-          OTHER_TRIGGERED=0
+          DURATION_MINUTES=130
 
-          trigger_other() {
-            local code
-            for t in 1 2 3; do
-              code=$(curl -s -o /tmp/dispatch.out -w "%{http_code}" --max-time 20 -X POST \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
-                "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-                -d "{\"event_type\":\"$OTHER_EVENT\"}" || true)
-              echo "🚀 Trigger $OTHER_EVENT attempt $t: HTTP $code"
-              if [ "$code" = "204" ]; then OTHER_TRIGGERED=1; return 0; fi
-              sleep 3
-            done
-            return 1
+          echo "==============================="
+          echo "✅ VPN is ACTIVE"
+          echo "✅ Receiver is ACTIVE on port 8081"
+          echo "✅ Cloudflared tunnel is ACTIVE"
+          echo "⏱ Running for ${DURATION_MINUTES} minutes. At minute 100, Instance A2 will be triggered."
+          echo "==============================="
+
+          trigger_a2() {
+            echo "==============================="
+            echo "🔄 Triggering Instance A2 (trigger_a2)..."
+            set +e
+            curl -s -X POST --connect-timeout 10 --max-time 15 \
+              -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{"event_type": "trigger_a2"}'
+            TRIGGER_EXIT=$?
+            set -e
+            if [ $TRIGGER_EXIT -ne 0 ]; then
+              echo "⚠️ A2 trigger curl failed — exit code $TRIGGER_EXIT"
+            else
+              echo "✅ Instance A2 trigger attempted!"
+            fi
+            echo "==============================="
           }
 
-          shutdown_instance() {
-            echo "🛑 [$(date +%H:%M:%S)] Shutting down instance $INSTANCE..."
-            curl -s --max-time 10 -X POST "${{ secrets.WORKER_URL }}/__deregister" \
-              -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"instance\":\"$INSTANCE\",\"url\":\"$TUNNEL_URL\"}" > /tmp/dereg.out 2>&1 || true
-            echo "Deregister: '$(cat /tmp/dereg.out 2>/dev/null || true)'"
-            kill "$CF_PID" 2>/dev/null || true
-            kill "$RECEIVER_PID" 2>/dev/null || true
-            sleep 1
-            sudo pkill -TERM openvpn 2>/dev/null || true
-            sleep 3
-            sudo pkill -KILL openvpn 2>/dev/null || true
-            echo "✅ Shutdown complete"
-          }
+          A2_TRIGGERED=0
+          FAILURE=0
 
-          MINUTE=0
-          while [ "$MINUTE" -lt "$DURATION_MINUTES" ]; do
-            MINUTE=$((MINUTE + 1))
+          for i in $(seq 1 $DURATION_MINUTES); do
+            set +e
+            CURRENT_IP=$(curl -s --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/tmp/loop_ip_err.log)
+            IP_EXIT=$?
+            set -e
 
-            if pgrep -x openvpn > /dev/null && ip link show tun0 > /dev/null 2>&1; then VPN_ST="ACTIVE"; else VPN_ST="DEAD"; fi
-            if kill -0 "$RECEIVER_PID" 2>/dev/null; then RCV_ST="ACTIVE"; else RCV_ST="DEAD"; fi
-            if kill -0 "$CF_PID" 2>/dev/null; then CF_ST="ACTIVE"; else CF_ST="DEAD"; fi
+            if [ $IP_EXIT -ne 0 ]; then
+              CURRENT_IP="UNKNOWN(curl_exit=$IP_EXIT)"
+            fi
 
-            IP_RC=0
-            CURRENT_IP=$(curl -s --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/tmp/loop_ip_err.log) || IP_RC=$?
-            if [ "$IP_RC" -ne 0 ] || [ -z "$CURRENT_IP" ]; then CURRENT_IP="UNKNOWN(curl_exit=$IP_RC)"; fi
+            if pgrep openvpn > /dev/null; then
+              VPN_STATUS="ACTIVE"
+            else
+              VPN_STATUS="DEAD"
+            fi
 
-            echo "✅ [$(date +%H:%M:%S)] Minute $MINUTE/$DURATION_MINUTES | VPN: $VPN_ST | Receiver: $RCV_ST | Cloudflared: $CF_ST | IP: $CURRENT_IP"
+            if pgrep -f receiver.py > /dev/null; then
+              RECEIVER_STATUS="ACTIVE"
+            else
+              RECEIVER_STATUS="DEAD"
+            fi
 
-            if [ "$VPN_ST" != "ACTIVE" ] || [ "$RCV_ST" != "ACTIVE" ] || [ "$CF_ST" != "ACTIVE" ]; then
-              echo "❌ A component died. Last logs:"
-              tail -n 20 /tmp/vpn.log || true
-              tail -n 20 /tmp/receiver.log || true
-              tail -n 20 /tmp/cloudflared.log || true
-              if [ "$OTHER_TRIGGERED" -eq 0 ]; then
-                echo "🚨 Emergency: triggering the other instance"
-                trigger_other || true
+            if pgrep -f "cloudflared tunnel" > /dev/null; then
+              CF_STATUS="ACTIVE"
+            else
+              CF_STATUS="DEAD"
+            fi
+
+            echo "✅ [$(date -u +"%H:%M:%S")] Minute $i/$DURATION_MINUTES | VPN: $VPN_STATUS | Receiver: $RECEIVER_STATUS | Cloudflared: $CF_STATUS | IP: $CURRENT_IP"
+
+            if [ "$i" -eq 100 ] && [ "$A2_TRIGGERED" -eq 0 ]; then
+              echo "⏱ Minute 100 — triggering Instance A2 (overlap window begins)"
+              trigger_a2
+              A2_TRIGGERED=1
+            fi
+
+            if [ "$VPN_STATUS" == "DEAD" ] || [ "$RECEIVER_STATUS" == "DEAD" ] || [ "$CF_STATUS" == "DEAD" ]; then
+              echo "❌ Something died at minute $i. Dumping logs..."
+              echo "--- VPN Log ---"
+              sudo cat /tmp/vpn.log || echo "⚠️ could not read vpn.log"
+              echo "--- Receiver Log ---"
+              cat /tmp/receiver.log || echo "⚠️ could not read receiver.log"
+              echo "--- Cloudflared Log ---"
+              cat /tmp/cloudflared.log || echo "⚠️ could not read cloudflared.log"
+              if [ "$A2_TRIGGERED" -eq 0 ]; then
+                echo "🔄 Triggering emergency A2 start before exiting..."
+                trigger_a2
+                A2_TRIGGERED=1
               fi
-              shutdown_instance
-              exit 1
-            fi
-
-            if [ $((MINUTE % HEARTBEAT_EVERY)) -eq 0 ]; then
-              HB=$(curl -s --max-time 10 -X POST "${{ secrets.WORKER_URL }}/__register" \
-                -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
-                -H "Content-Type: application/json" \
-                -d "{\"instance\":\"$INSTANCE\",\"url\":\"$TUNNEL_URL\"}" || true)
-              echo "💓 Heartbeat: '$HB'"
-            fi
-
-            if [ "$MINUTE" -ge "$TRIGGER_MINUTE" ] && [ "$OTHER_TRIGGERED" -eq 0 ]; then
-              echo "🚀 Minute $MINUTE: triggering the other instance"
-              trigger_other || echo "⚠️ Trigger failed, will retry next minute"
+              FAILURE=1
+              break
             fi
 
             sleep 60
           done
 
-          if [ "$OTHER_TRIGGERED" -eq 0 ]; then
-            echo "⚠️ Last chance: the other instance was never triggered"
-            trigger_other || echo "❌ Last-chance trigger failed"
+          if [ "$FAILURE" == "1" ]; then
+            echo "==============================="
+            echo "❌ Instance A exiting with FAILURE status (component died early at minute $i)"
+            echo "✅ Overlap preserved — Instance A2 was already triggered before exit"
+            echo "==============================="
+            exit 1
+          else
+            echo "==============================="
+            echo "⏱ ${DURATION_MINUTES} minutes reached — Instance A shutting down normally."
+            echo "✅ Instance A2 should already be active and serving traffic."
+            echo "==============================="
           fi
-          shutdown_instance
-          echo "✅ Instance $INSTANCE finished its $DURATION_MINUTES minutes"
 
-      - name: Deregister (safety)
+      - name: Deregister from tunnel-proxy
         if: always()
         run: |
-          set -Eeuo pipefail
-          if [ -z "${TUNNEL_URL:-}" ]; then
-            echo "No tunnel URL, nothing to deregister"
-            exit 0
+          if [ -f /tmp/tunnel_url.txt ]; then
+            URL=$(cat /tmp/tunnel_url.txt)
+            curl -s --max-time 15 -X POST "${{ secrets.WORKER_URL }}/__deregister" \
+              -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"instance\":\"A\",\"url\":\"$URL\"}" || true
+            echo "✅ Deregistered from tunnel-proxy"
           fi
-          RESP=$(curl -s --max-time 10 -X POST "${{ secrets.WORKER_URL }}/__deregister" \
-            -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"instance\":\"A\",\"url\":\"$TUNNEL_URL\"}" || true)
-          echo "Safety deregister: '$RESP'"
