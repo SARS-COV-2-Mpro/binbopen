@@ -278,29 +278,36 @@ jobs:
           while [ "$MINUTE" -lt "$DURATION_MINUTES" ]; do
             MINUTE=$((MINUTE + 1))
 
+            # 1. Local process checks
             if pgrep -x openvpn > /dev/null && ip link show tun0 > /dev/null 2>&1; then VPN_ST="ACTIVE"; else VPN_ST="DEAD"; fi
             if kill -0 "$RECEIVER_PID" 2>/dev/null; then RCV_ST="ACTIVE"; else RCV_ST="DEAD"; fi
             if kill -0 "$CF_PID" 2>/dev/null; then CF_ST="ACTIVE"; else CF_ST="DEAD"; fi
+
+            # 2. FULL CHAIN TEST (Checks Binance Worker end-to-end)
+            PING_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://curly-field-a765.abdo-xchg-61892.workers.dev/fapi/v1/ping" || true)
+            if [ "$PING_CODE" = "200" ]; then CHAIN_ST="ACTIVE"; else CHAIN_ST="DEAD(http_$PING_CODE)"; fi
 
             IP_RC=0
             CURRENT_IP=$(curl -s --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/tmp/loop_ip_err.log) || IP_RC=$?
             if [ "$IP_RC" -ne 0 ] || [ -z "$CURRENT_IP" ]; then CURRENT_IP="UNKNOWN(curl_exit=$IP_RC)"; fi
 
-            echo "✅ [$(date +%H:%M:%S)] Minute $MINUTE/$DURATION_MINUTES | VPN: $VPN_ST | Receiver: $RCV_ST | Cloudflared: $CF_ST | IP: $CURRENT_IP"
+            echo "✅ [$(date +%H:%M:%S)] Minute $MINUTE/$DURATION_MINUTES | VPN: $VPN_ST | Receiver: $RCV_ST | Tunnel: $CF_ST | Full Chain: $CHAIN_ST | IP: $CURRENT_IP"
 
-            if [ "$VPN_ST" != "ACTIVE" ] || [ "$RCV_ST" != "ACTIVE" ] || [ "$CF_ST" != "ACTIVE" ]; then
-              echo "❌ A component died. Last logs:"
-              tail -n 20 /tmp/vpn.log || true
-              tail -n 20 /tmp/receiver.log || true
-              tail -n 20 /tmp/cloudflared.log || true
+            # IF ANYTHING FAILS (including Binance Worker full chain test): TRIGGER OTHER AND DIE
+            if [ "$VPN_ST" != "ACTIVE" ] || [ "$RCV_ST" != "ACTIVE" ] || [ "$CF_ST" != "ACTIVE" ] || [ "$CHAIN_ST" != "ACTIVE" ]; then
+              echo "❌ Component or Full Chain failed! (Binance Worker HTTP: $PING_CODE)"
+              echo "Last logs:"
+              tail -n 15 /tmp/vpn.log || true
+              tail -n 15 /tmp/cloudflared.log || true
               if [ "$OTHER_TRIGGERED" -eq 0 ]; then
-                echo "🚨 Emergency: triggering the other instance"
+                echo "🚨 Emergency: triggering the other instance immediately!"
                 trigger_other || true
               fi
               shutdown_instance
               exit 1
             fi
 
+            # Heartbeat every 5 minutes
             if [ $((MINUTE % HEARTBEAT_EVERY)) -eq 0 ]; then
               HB=$(curl -s --max-time 10 -X POST "${{ secrets.WORKER_URL }}/__register" \
                 -H "X-Secret: ${{ secrets.REGISTER_SECRET }}" \
@@ -309,6 +316,7 @@ jobs:
               echo "💓 Heartbeat: '$HB'"
             fi
 
+            # Trigger handoff at minute 295
             if [ "$MINUTE" -ge "$TRIGGER_MINUTE" ] && [ "$OTHER_TRIGGERED" -eq 0 ]; then
               echo "🚀 Minute $MINUTE: triggering the other instance"
               trigger_other || echo "⚠️ Trigger failed, will retry next minute"
