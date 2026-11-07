@@ -370,8 +370,8 @@ jobs:
           set -Eeuo pipefail
           trap 'echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Run Task and Ping Pong Loop"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"; echo "Timestamp (UTC): $(date -u +"%Y-%m-%dT%H:%M:%SZ")"' ERR
 
-          DURATION_MINUTES=130
-          TRIGGER_MINUTE=125
+          DURATION_MINUTES=8
+          TRIGGER_MINUTE=5
 
           echo "==============================="
           echo "✅ VPN, Receiver and Cloudflared are ACTIVE"
