@@ -184,8 +184,8 @@ jobs:
           trap 'rc=$?; echo "❌❌❌ FATAL ERROR (uncaught) ❌❌❌"; echo "Step: Start Cloudflared Quick Tunnel and Register"; echo "Line: $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $rc"; echo "Timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"' ERR
           INSTANCE="A2"
           ./cloudflared --version
-          echo "--- Starting cloudflared quick tunnel ---"
-          nohup ./cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8081 > /tmp/cloudflared.log 2>&1 &
+          echo "--- Starting cloudflared quick tunnel (4 HA connections) ---"
+          nohup ./cloudflared tunnel --no-autoupdate --protocol http2 --ha-connections 4 --url http://127.0.0.1:8081 > /tmp/cloudflared.log 2>&1 &
           CFPID=$!
           echo "CF_PID=$CFPID" >> $GITHUB_ENV
           echo "✅ cloudflared PID: $CFPID"
@@ -283,9 +283,17 @@ jobs:
             if kill -0 "$RECEIVER_PID" 2>/dev/null; then RCV_ST="ACTIVE"; else RCV_ST="DEAD"; fi
             if kill -0 "$CF_PID" 2>/dev/null; then CF_ST="ACTIVE"; else CF_ST="DEAD"; fi
 
-            # 2. FULL CHAIN TEST (Checks Binance Worker end-to-end)
-            PING_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://curly-field-a765.abdo-xchg-61892.workers.dev/fapi/v1/ping" || true)
-            if [ "$PING_CODE" = "200" ]; then CHAIN_ST="ACTIVE"; else CHAIN_ST="DEAD(http_$PING_CODE)"; fi
+            # 2. FULL CHAIN TEST (3 retries to absorb network jitter)
+            CHAIN_ST="DEAD(http_000)"
+            PING_CODE="000"
+            for try in 1 2 3; do
+              PING_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://curly-field-a765.abdo-xchg-61892.workers.dev/fapi/v1/ping" || true)
+              if [ "$PING_CODE" = "200" ]; then
+                CHAIN_ST="ACTIVE"
+                break
+              fi
+              sleep 2
+            done
 
             IP_RC=0
             CURRENT_IP=$(curl -s --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/tmp/loop_ip_err.log) || IP_RC=$?
@@ -293,7 +301,7 @@ jobs:
 
             echo "✅ [$(date +%H:%M:%S)] Minute $MINUTE/$DURATION_MINUTES | VPN: $VPN_ST | Receiver: $RCV_ST | Tunnel: $CF_ST | Full Chain: $CHAIN_ST | IP: $CURRENT_IP"
 
-            # IF ANYTHING FAILS (including Binance Worker full chain test): TRIGGER OTHER AND DIE
+            # IF ANYTHING FAILS (including Binance Worker full chain test after 3 retries): TRIGGER OTHER AND DIE
             if [ "$VPN_ST" != "ACTIVE" ] || [ "$RCV_ST" != "ACTIVE" ] || [ "$CF_ST" != "ACTIVE" ] || [ "$CHAIN_ST" != "ACTIVE" ]; then
               echo "❌ Component or Full Chain failed! (Binance Worker HTTP: $PING_CODE)"
               echo "Last logs:"
