@@ -8,7 +8,7 @@ on:
 jobs:
   run-instance-a2:
     runs-on: ubuntu-latest
-    timeout-minutes: 175
+    timeout-minutes: 350
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
