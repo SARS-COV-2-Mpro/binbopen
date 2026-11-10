@@ -3,6 +3,9 @@ import os
 import ssl
 import sys
 import json
+import time
+import random
+import socket
 import threading
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("RECEIVER_PORT", "8081"))
 TIMEOUT = 15
 POOL_SIZE = 8
+WARM = 2
+KEEPALIVE_SEC = 20
 SECRET = os.environ.get("RECEIVER_SECRET", "")
 
 HOST_FUTURES = "fapi.binance.com"
@@ -25,6 +30,41 @@ DROP_REQ_EXACT = {
 DROP_REQ_PREFIX = ("cf-", "x-forwarded-")
 DROP_RESP = {"connection", "keep-alive", "transfer-encoding", "content-length"}
 
+_dns = {}
+_dns_lock = threading.Lock()
+DNS_TTL = 300
+
+
+def resolve(host):
+    now = time.time()
+    with _dns_lock:
+        hit = _dns.get(host)
+        if hit and now - hit[0] < DNS_TTL:
+            return random.choice(hit[1])
+    infos = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+    ips = sorted({i[4][0] for i in infos})
+    with _dns_lock:
+        _dns[host] = (now, ips)
+    return random.choice(ips)
+
+
+def forget_dns(host):
+    with _dns_lock:
+        _dns.pop(host, None)
+
+
+class Conn(http.client.HTTPSConnection):
+    def connect(self):
+        try:
+            ip = resolve(self.host)
+            sock = socket.create_connection((ip, self.port), self.timeout)
+        except Exception:
+            forget_dns(self.host)
+            raise
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
 
 class Pool:
     def __init__(self, host):
@@ -36,10 +76,10 @@ class Pool:
         with self.lock:
             if self.idle:
                 return self.idle.pop()
-        return http.client.HTTPSConnection(self.host, timeout=TIMEOUT, context=CTX)
+        return Conn(self.host, timeout=TIMEOUT, context=CTX)
 
     def fresh(self):
-        return http.client.HTTPSConnection(self.host, timeout=TIMEOUT, context=CTX)
+        return Conn(self.host, timeout=TIMEOUT, context=CTX)
 
     def put(self, conn):
         with self.lock:
@@ -61,10 +101,15 @@ def pick_host(path):
     return HOST_FUTURES
 
 
+def vpn_up():
+    return os.path.exists("/sys/class/net/tun0")
+
+
 def do_upstream(host, method, path, headers, body):
     pool = POOLS[host]
+    t0 = time.time()
     conn = pool.get()
-    reused = conn.sock is not None
+    mode = "reused" if conn.sock is not None else "new"
     try:
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
@@ -74,14 +119,15 @@ def do_upstream(host, method, path, headers, body):
             conn.close()
         except Exception:
             pass
-        if not reused:
+        if mode == "new":
             raise
         # stale pooled connection: retry once on a brand new one
+        mode = "retry"
         conn = pool.fresh()
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         data = resp.read()
-    status, reason, rheaders = resp.status, resp.reason, resp.getheaders()
+    status, rheaders = resp.status, resp.getheaders()
     if resp.will_close:
         try:
             conn.close()
@@ -89,12 +135,35 @@ def do_upstream(host, method, path, headers, body):
             pass
     else:
         pool.put(conn)
-    return status, rheaders, data
+    ms = int((time.time() - t0) * 1000)
+    return status, rheaders, data, mode, ms
+
+
+def warm_and_keepalive():
+    # open a few connections up front, then keep one alive
+    time.sleep(1)
+    for host in (HOST_FUTURES, HOST_SPOT):
+        for _ in range(WARM):
+            try:
+                if not vpn_up():
+                    break
+                c = POOLS[host].fresh()
+                c.connect()
+                POOLS[host].put(c)
+            except Exception:
+                pass
+    while True:
+        time.sleep(KEEPALIVE_SEC)
+        try:
+            if vpn_up():
+                do_upstream(HOST_FUTURES, "GET", "/fapi/v1/ping", {}, None)
+        except Exception:
+            pass
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "receiver/2"
+    server_version = "receiver/3"
 
     def log_message(self, fmt, *args):
         pass
@@ -116,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(403, b'{"error":"forbidden"}',
                                {"Content-Type": "application/json", "X-Not-Forwarded": "1"})
 
-        if not os.path.exists("/sys/class/net/tun0"):
+        if not vpn_up():
             return self._reply(503, b'{"error":"vpn down"}',
                                {"Content-Type": "application/json", "X-Not-Forwarded": "1"})
 
@@ -129,7 +198,8 @@ class Handler(BaseHTTPRequestHandler):
 
         host = pick_host(self.path)
         try:
-            status, rheaders, data = do_upstream(host, self.command, self.path, out, body)
+            status, rheaders, data, mode, ms = do_upstream(
+                host, self.command, self.path, out, body)
         except Exception as e:
             msg = json.dumps({"error": "upstream", "detail": str(e)[:200]}).encode()
             return self._reply(502, msg,
@@ -141,6 +211,8 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             self.send_header(k, v)
         self.send_header("X-Via-Receiver", "1")
+        self.send_header("X-Pool", mode)
+        self.send_header("X-Upstream-Ms", str(ms))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if self.command != "HEAD" and data:
@@ -156,6 +228,7 @@ class Server(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     print(f"receiver listening on 0.0.0.0:{PORT}", flush=True)
+    threading.Thread(target=warm_and_keepalive, daemon=True).start()
     try:
         Server(("0.0.0.0", PORT), Handler).serve_forever()
     except KeyboardInterrupt:
