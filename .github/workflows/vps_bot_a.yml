@@ -226,6 +226,24 @@ jobs:
           done
           ./startup_fail.sh "receiver did not become ready"
 
+      - name: Latency diagnostic (temporary)
+        continue-on-error: true
+        run: |
+          echo "---- VPN protocol and server ----"
+          grep -E '^(remote|proto) ' vpn.ovpn || true
+          echo "---- 4 calls on ONE connection, direct to Binance via tun0 ----"
+          U=https://fapi.binance.com/fapi/v1/time
+          curl -sS -o /dev/null -o /dev/null -o /dev/null -o /dev/null --interface tun0 --max-time 30 \
+            -w "dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+            $U $U $U $U || true
+          echo "---- 4 calls on ONE connection, through local receiver.py ----"
+          R=http://127.0.0.1:8081/fapi/v1/time
+          curl -sS -o /dev/null -o /dev/null -o /dev/null -o /dev/null --max-time 30 \
+            -w "connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+            $R $R $R $R || true
+          echo "---- RTT through the VPN ----"
+          ping -c 4 -W 3 -I tun0 1.1.1.1 || true
+
       - name: Route cloudflared outside VPN
         run: |
           set -Eeuo pipefail
