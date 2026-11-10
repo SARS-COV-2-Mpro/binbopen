@@ -1,99 +1,162 @@
 #!/usr/bin/env python3
-import http.server
-import urllib.request
-import urllib.error
-import subprocess
+import os
+import ssl
+import sys
+import json
+import threading
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BINANCE_BASE = "https://fapi.binance.com"
+PORT = int(os.environ.get("RECEIVER_PORT", "8081"))
+TIMEOUT = 15
+POOL_SIZE = 8
+SECRET = os.environ.get("RECEIVER_SECRET", "")
 
-STRIP_HEADERS = [
-    'host', 'content-length',
-    'x-forwarded-for', 'x-real-ip', 'x-client-ip', 'cf-connecting-ip',
-    'true-client-ip', 'forwarded', 'forwarded-for', 'x-forwarded',
-    'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'via',
-    'cf-ray', 'cf-ipcountry', 'cdn-loop', 'cf-visitor', 'cf-worker', 'cf-ew-via',
-]
+HOST_FUTURES = "fapi.binance.com"
+HOST_SPOT = "api.binance.com"
 
-def is_vpn_active():
-    try:
-        r = subprocess.run(['ip', 'link', 'show', 'tun0'],
-                           capture_output=True, text=True, timeout=3)
-        return r.returncode == 0
-    except Exception:
-        return False
+CTX = ssl.create_default_context()
 
-class ReceiverHandler(http.server.BaseHTTPRequestHandler):
-    # Mark every response as "this really came from the receiver"
-    def end_headers(self):
-        self.send_header('X-Via-Receiver', '1')
-        super().end_headers()
+DROP_REQ_EXACT = {
+    "host", "content-length", "connection", "keep-alive", "proxy-connection",
+    "transfer-encoding", "upgrade", "te", "trailer", "x-proxy-secret",
+    "cdn-loop", "true-client-ip", "x-real-ip",
+}
+DROP_REQ_PREFIX = ("cf-", "x-forwarded-")
+DROP_RESP = {"connection", "keep-alive", "transfer-encoding", "content-length"}
 
-    def do_GET(self):    self.forward_request('GET')
-    def do_POST(self):   self.forward_request('POST')
-    def do_PUT(self):    self.forward_request('PUT')
-    def do_DELETE(self): self.forward_request('DELETE')
 
-    def forward_request(self, method):
-        print(f"[RECEIVER] Incoming {method} request: {self.path}")
+class Pool:
+    def __init__(self, host):
+        self.host = host
+        self.idle = []
+        self.lock = threading.Lock()
 
-        # Read body first so the connection stays clean even if we refuse
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length) if content_length > 0 else None
+    def get(self):
+        with self.lock:
+            if self.idle:
+                return self.idle.pop()
+        return http.client.HTTPSConnection(self.host, timeout=TIMEOUT, context=CTX)
 
-        if not is_vpn_active():
-            print("[RECEIVER] ❌ VPN (tun0) is NOT active — refusing to forward")
-            self.send_response(503)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('X-Not-Forwarded', '1')
-            self.end_headers()
-            self.wfile.write(b'{"error": "VPN tunnel is not active on receiver"}')
-            return
+    def fresh(self):
+        return http.client.HTTPSConnection(self.host, timeout=TIMEOUT, context=CTX)
 
-        target_url = BINANCE_BASE + self.path
-        print(f"[RECEIVER] ✅ VPN active, forwarding to -> {target_url}")
-
-        headers = {}
-        stripped = []
-        for k, v in self.headers.items():
-            if k.lower() in STRIP_HEADERS:
-                stripped.append(k)
-            else:
-                headers[k] = v
-        if stripped:
-            print(f"[RECEIVER] ⚠️ Stripped headers: {stripped}")
-        print(f"[RECEIVER] Final header names sent: {list(headers.keys())}")
-
-        req = urllib.request.Request(target_url, data=body, headers=headers, method=method)
-
+    def put(self, conn):
+        with self.lock:
+            if len(self.idle) < POOL_SIZE:
+                self.idle.append(conn)
+                return
         try:
-            with urllib.request.urlopen(req, timeout=15) as response:
-                print(f"[RECEIVER] ✅ Binance responded with status {response.status}")
-                data = response.read()
-                self.send_response(response.status)
-                for header, value in response.getheaders():
-                    if header.lower() not in ['transfer-encoding', 'connection']:
-                        self.send_header(header, value)
-                self.end_headers()
-                self.wfile.write(data)
-        except urllib.error.HTTPError as e:
-            print(f"[RECEIVER] ⚠️ Binance returned HTTP error {e.code}")
-            err_body = e.read()
-            print(f"[RECEIVER] ⚠️ Binance error body: {err_body}")
-            self.send_response(e.code)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(err_body)
+            conn.close()
+        except Exception:
+            pass
+
+
+POOLS = {HOST_FUTURES: Pool(HOST_FUTURES), HOST_SPOT: Pool(HOST_SPOT)}
+
+
+def pick_host(path):
+    if path.startswith("/api/") or path.startswith("/sapi/"):
+        return HOST_SPOT
+    return HOST_FUTURES
+
+
+def do_upstream(host, method, path, headers, body):
+    pool = POOLS[host]
+    conn = pool.get()
+    reused = conn.sock is not None
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if not reused:
+            raise
+        # stale pooled connection: retry once on a brand new one
+        conn = pool.fresh()
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+    status, reason, rheaders = resp.status, resp.reason, resp.getheaders()
+    if resp.will_close:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    else:
+        pool.put(conn)
+    return status, rheaders, data
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "receiver/2"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _reply(self, code, body=b"", headers=None):
+        self.send_response(code)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
+
+    def handle_any(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length > 0 else None
+
+        if SECRET and self.headers.get("X-Proxy-Secret") != SECRET:
+            return self._reply(403, b'{"error":"forbidden"}',
+                               {"Content-Type": "application/json", "X-Not-Forwarded": "1"})
+
+        if not os.path.exists("/sys/class/net/tun0"):
+            return self._reply(503, b'{"error":"vpn down"}',
+                               {"Content-Type": "application/json", "X-Not-Forwarded": "1"})
+
+        out = {}
+        for k, v in self.headers.items():
+            kl = k.lower()
+            if kl in DROP_REQ_EXACT or kl.startswith(DROP_REQ_PREFIX):
+                continue
+            out[k] = v
+
+        host = pick_host(self.path)
+        try:
+            status, rheaders, data = do_upstream(host, self.command, self.path, out, body)
         except Exception as e:
-            print(f"[RECEIVER] ❌ Exception while forwarding: {e}")
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(str(e).encode())
+            msg = json.dumps({"error": "upstream", "detail": str(e)[:200]}).encode()
+            return self._reply(502, msg,
+                               {"Content-Type": "application/json", "X-Not-Forwarded": "1"})
 
-    def log_message(self, format, *args):
-        print("[RECEIVER LOG] " + (format % args))
+        self.send_response(status)
+        for k, v in rheaders:
+            if k.lower() in DROP_RESP:
+                continue
+            self.send_header(k, v)
+        self.send_header("X-Via-Receiver", "1")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD" and data:
+            self.wfile.write(data)
 
-if __name__ == '__main__':
-    print("✅ Receiver starting on port 8081 -> forwarding to fapi.binance.com")
-    server = http.server.ThreadingHTTPServer(('0.0.0.0', 8081), ReceiverHandler)
-    server.serve_forever()
+    do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = handle_any
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+
+if __name__ == "__main__":
+    print(f"receiver listening on 0.0.0.0:{PORT}", flush=True)
+    try:
+        Server(("0.0.0.0", PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        sys.exit(0)
