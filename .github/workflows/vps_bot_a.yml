@@ -4,11 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       duration:
-        description: 'Run minutes'
-        default: '300'
+        description: "Duration in minutes"
+        required: false
+        default: "300"
       trigger:
-        description: 'Handoff minute'
-        default: '295'
+        description: "Minute to trigger the other instance"
+        required: false
+        default: "295"
   repository_dispatch:
     types: [trigger_a]
 
