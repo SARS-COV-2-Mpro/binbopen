@@ -16,7 +16,7 @@ on:
 
 jobs:
   run-instance-b:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 350
     env:
       INSTANCE: "B"
@@ -37,6 +37,17 @@ jobs:
           echo "Instance: $INSTANCE | other: $OTHER_EVENT"
           echo "Duration: $DURATION_MINUTES min | handoff at: $TRIGGER_MINUTE min"
           ls -la receiver.py
+
+      - name: Ensure DNS works
+        run: |
+          echo "---- current resolv.conf ----"
+          cat /etc/resolv.conf || true
+          echo "---- injecting public DNS ----"
+          sudo sh -c 'printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 9.9.9.9\n" > /etc/resolv.conf'
+          echo "---- verify ----"
+          getent hosts security.ubuntu.com || true
+          getent hosts archive.ubuntu.com  || true
+          getent hosts github.com          || true
 
       - name: Download cloudflared
         run: |
@@ -99,7 +110,13 @@ jobs:
       - name: Install OpenVPN
         run: |
           set -Eeuo pipefail
-          sudo apt-get update -qq
+          ok=0
+          for i in 1 2 3 4 5; do
+            if sudo apt-get update -qq; then ok=1; break; fi
+            echo "apt-get update failed, retry $i in 10s..."
+            sleep 10
+          done
+          [ "$ok" = 1 ] || { echo "apt-get update failed after 5 attempts"; exit 1; }
           sudo apt-get install -y -qq openvpn curl python3 iproute2
 
       - name: Setup VPN credentials
@@ -383,6 +400,8 @@ jobs:
       - name: Debug on failure
         if: failure()
         run: |
+          echo "---- resolv.conf ----"
+          cat /etc/resolv.conf 2>/dev/null || true
           echo "---- cloudflared.log ----"
           cat cloudflared.log 2>/dev/null || true
           echo "---- processes ----"
