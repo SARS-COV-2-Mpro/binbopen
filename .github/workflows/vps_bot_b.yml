@@ -1,4 +1,9 @@
 name: Continuous VPN Worker - Instance B
+
+env:
+  DEFAULT_DURATION: "30"
+  DEFAULT_TRIGGER: "20"
+
 on:
   repository_dispatch:
     types: [trigger_a2]
@@ -19,8 +24,8 @@ jobs:
     env:
       INSTANCE: "B"
       OTHER_EVENT: "trigger_a"
-      DURATION: ${{ github.event.inputs.duration || '30' }}
-      TRIGGER: ${{ github.event.inputs.trigger || '20' }}
+      DURATION: ${{ github.event.inputs.duration || env.DEFAULT_DURATION }}
+      TRIGGER: ${{ github.event.inputs.trigger || env.DEFAULT_TRIGGER }}
       WD: ${{ github.workspace }}
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
       CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
