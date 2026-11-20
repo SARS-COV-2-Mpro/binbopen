@@ -1,5 +1,4 @@
 name: Continuous VPN Worker - Instance A
-
 on:
   repository_dispatch:
     types: [trigger_a]
@@ -7,14 +6,12 @@ on:
     inputs:
       duration:
         description: "Minutes to run"
-        default: "300"
+        default: "30"
       trigger:
         description: "Minute at which to start the other instance"
-        default: "295"
-
+        default: "20"
 permissions:
   contents: read
-
 jobs:
   run-instance-a:
     runs-on: ubuntu-22.04
@@ -22,8 +19,8 @@ jobs:
     env:
       INSTANCE: "A"
       OTHER_EVENT: "trigger_a2"
-      DURATION: ${{ github.event.inputs.duration || '300' }}
-      TRIGGER: ${{ github.event.inputs.trigger || '295' }}
+      DURATION: ${{ github.event.inputs.duration || '30' }}
+      TRIGGER: ${{ github.event.inputs.trigger || '20' }}
       WD: ${{ github.workspace }}
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
       CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
@@ -32,11 +29,9 @@ jobs:
       VPN_CONFIG: ${{ secrets.VPN_CONFIG }}
       VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
       VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Job Info
         run: |
           echo "Instance:  $INSTANCE"
@@ -45,7 +40,6 @@ jobs:
           echo "Run id:    $GITHUB_RUN_ID"
           date -u
           ls -la receiver.py
-
       - name: Ensure DNS works
         run: |
           echo "---- current resolv.conf ----"
@@ -56,7 +50,6 @@ jobs:
           getent hosts security.ubuntu.com || true
           getent hosts archive.ubuntu.com  || true
           getent hosts github.com          || true
-
       - name: Download cloudflared
         run: |
           curl -fsSL -o cloudflared \
@@ -64,7 +57,6 @@ jobs:
           chmod +x cloudflared
           sudo install -m 755 cloudflared /usr/local/bin/cfd
           ./cloudflared --version
-
       - name: Validate secrets
         run: |
           missing=0
@@ -73,7 +65,6 @@ jobs:
           done
           [ "$missing" = 0 ] || exit 1
           echo "all required secrets present"
-
       - name: Create helper scripts
         run: |
           cat > "$WD/startup_fail.sh" <<'EOF'
@@ -81,7 +72,6 @@ jobs:
           echo "STARTUP FAILED: $*"
           exit 1
           EOF
-
           cat > "$WD/start_cf.sh" <<'EOF'
           #!/usr/bin/env bash
           set -u
@@ -94,11 +84,9 @@ jobs:
             *)     TOKEN="$CLEAN" ;;
           esac
           if [ -z "$TOKEN" ]; then echo "empty tunnel token"; exit 1; fi
-
           sudo pkill -f 'tunnel --no-autoupdate run' 2>/dev/null || true
           sleep 2
           : > "$WD/cloudflared.log"
-
           if [ "${CF_MODE:-plain}" = "isolated" ]; then
             nohup sudo -u cfuser env HOME=/tmp TUNNEL_TOKEN="$TOKEN" \
               TUNNEL_TRANSPORT_PROTOCOL=http2 \
@@ -109,7 +97,6 @@ jobs:
               "$WD/cloudflared" tunnel --no-autoupdate run \
               >> "$WD/cloudflared.log" 2>&1 &
           fi
-
           for i in $(seq 1 60); do
             if grep -q "Registered tunnel connection" "$WD/cloudflared.log"; then
               echo "tunnel registered after ${i}s (mode=${CF_MODE:-plain})"
@@ -122,7 +109,6 @@ jobs:
           exit 1
           EOF
           chmod +x "$WD/startup_fail.sh" "$WD/start_cf.sh"
-
       - name: Install OpenVPN
         run: |
           ok=0
@@ -134,7 +120,6 @@ jobs:
           [ "$ok" = 1 ] || { echo "apt-get update failed after 5 attempts"; exit 1; }
           sudo apt-get install -y -qq openvpn
           openvpn --version | head -n 1
-
       - name: Setup VPN credentials
         run: |
           printf '%s' "$VPN_CONFIG" > vpn.ovpn
@@ -148,7 +133,6 @@ jobs:
             echo "data-ciphers-fallback AES-128-CBC"
           } >> vpn.ovpn
           echo "vpn.ovpn written ($(wc -l < vpn.ovpn) lines)"
-
       - name: Check IP before VPN
         run: |
           echo "runner IP before VPN: $(curl -s --max-time 10 https://api.ipify.org)"
@@ -156,7 +140,6 @@ jobs:
           echo "original gateway: $GW dev $IF"
           echo "ORIG_GW=$GW" >> "$GITHUB_ENV"
           echo "ORIG_IF=$IF" >> "$GITHUB_ENV"
-
       - name: Start VPN
         run: |
           sudo pkill openvpn 2>/dev/null || true
@@ -180,7 +163,6 @@ jobs:
             sleep 8
           done
           [ "$OK" = 1 ] || bash "$WD/startup_fail.sh" "VPN did not connect after 80 attempts"
-
       - name: Verify VPN
         run: |
           ok=0
@@ -191,7 +173,6 @@ jobs:
           done
           echo "binance ping via tun0: $ok / 30 succeeded"
           [ "$ok" -ge 20 ] || bash "$WD/startup_fail.sh" "VPN unstable ($ok/30)"
-
       - name: Exit IP gate
         run: |
           IP=$(curl -s --interface tun0 --max-time 10 https://api.ipify.org || true)
@@ -200,7 +181,6 @@ jobs:
           if [ -n "${EXPECTED_EXIT_IP:-}" ] && [ "$IP" != "$EXPECTED_EXIT_IP" ]; then
             bash "$WD/startup_fail.sh" "exit IP $IP is not the expected one"
           fi
-
       - name: Start Receiver
         run: |
           nohup python3 receiver.py > "$WD/receiver.log" 2>&1 &
@@ -212,7 +192,6 @@ jobs:
           done
           echo "receiver not ready"; tail -n 30 "$WD/receiver.log"
           exit 1
-
       - name: Latency diagnostic (temporary)
         continue-on-error: true
         run: |
@@ -233,7 +212,6 @@ jobs:
           done
           echo "---- RTT through the VPN ----"
           ping -c 4 -W 3 -I tun0 1.1.1.1 || true
-
       - name: Route cloudflared outside VPN
         run: |
           CF_MODE=isolated
@@ -255,11 +233,9 @@ jobs:
           else
             echo "WARNING: cloudflared will run inside the VPN path"
           fi
-
       - name: Start Cloudflare Named Tunnel
         run: |
           bash "$WD/start_cf.sh"
-
       - name: Run Task and Handoff Loop
         run: |
           set +e
@@ -271,7 +247,6 @@ jobs:
           TRIGGERED=0
           LFAILS=0
           PFAILS=0
-
           trigger_other() {
             code=$(curl -s -o /tmp/disp.txt -w '%{http_code}' -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -281,39 +256,32 @@ jobs:
             echo "trigger $OTHER_EVENT -> HTTP $code"
             [ "$code" = "204" ]
           }
-
           restart_receiver() {
             pkill -f receiver.py 2>/dev/null
             sleep 1
             nohup python3 receiver.py >> "$WD/receiver.log" 2>&1 &
             sleep 3
           }
-
           restart_tunnel() {
             echo "restarting tunnel..."
             bash "$WD/start_cf.sh"
           }
-
           fail_over() {
             echo "FAIL-OVER: $1"
             [ "$TRIGGERED" = 1 ] || trigger_other
             exit 1
           }
-
           while true; do
             NOW=$(date +%s)
             EL=$((NOW - START))
             MIN=$((EL / 60))
             [ "$EL" -ge "$DUR_S" ] && break
-
             if [ "$TRIGGERED" = 0 ] && [ "$EL" -ge "$TRIG_S" ]; then
               trigger_other && TRIGGERED=1
             fi
-
             if ! ip link show tun0 >/dev/null 2>&1; then
               fail_over "tun0 disappeared"
             fi
-
             lcode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
               http://127.0.0.1:8081/fapi/v1/ping)
             if [ "$lcode" = "200" ]; then
@@ -324,7 +292,6 @@ jobs:
               restart_receiver
               [ "$LFAILS" -ge 3 ] && fail_over "receiver not answering"
             fi
-
             if curl -s -D - -o /dev/null --max-time 15 "$URL/fapi/v1/ping" \
                  | tr -d '\r' | grep -qi '^x-via-receiver: 1'; then
               PFAILS=0
@@ -337,17 +304,14 @@ jobs:
                 PFAILS=0
               fi
             fi
-
             echo "min $MIN/$DURATION  tun0=up  local=$lcode  public=$pub  handoff_sent=$TRIGGERED"
             sleep 60
           done
-
           if [ "$TRIGGERED" = 0 ]; then
             echo "time is up and the other instance was never triggered; trying now"
             trigger_other
           fi
           echo "duration reached, exiting"
-
       - name: Debug on failure
         if: failure()
         run: |
@@ -357,7 +321,6 @@ jobs:
           echo "---- vpn.log ----";   sudo tail -n 40 vpn.log || true
           echo "---- receiver.log ----";    tail -n 40 receiver.log || true
           echo "---- cloudflared.log ----"; tail -n 40 cloudflared.log || true
-
       - name: Cleanup
         if: always()
         run: |
