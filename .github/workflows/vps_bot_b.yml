@@ -19,8 +19,8 @@ jobs:
     env:
       INSTANCE: "B"
       OTHER_EVENT: "trigger_a"
-      DURATION: ${{ github.event.inputs.duration || '30' }}
-      TRIGGER: ${{ github.event.inputs.trigger || '20' }}
+      DURATION: ${{ github.event.inputs.duration || '120' }}
+      TRIGGER: ${{ github.event.inputs.trigger || '110' }}
       WD: ${{ github.workspace }}
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
       CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
