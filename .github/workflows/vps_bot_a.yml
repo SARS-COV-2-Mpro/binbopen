@@ -57,7 +57,7 @@ jobs:
           done
           [ "$missing" = 0 ] || exit 1
 
-          # write vpn config — no indentation inside heredoc
+          # write vpn config
           printf '%s' "$VPN_CONFIG" > vpn.ovpn
           sed -i 's/\r$//' vpn.ovpn
           sed -i 's/^proto udp.*/proto tcp/' vpn.ovpn
@@ -66,20 +66,18 @@ jobs:
           printf '%s\n%s\n' "$VPN_USERNAME" "$VPN_PASSWORD" > pass.txt
           chmod 600 pass.txt
 
-          # append extra options — using printf to avoid heredoc indent issues
-          printf '\nauth-user-pass %s/pass.txt\n' "$WD"  >> vpn.ovpn
-          printf 'auth-nocache\n'                         >> vpn.ovpn
-          printf 'data-ciphers AES-128-CBC\n'             >> vpn.ovpn
-          printf 'data-ciphers-fallback AES-128-CBC\n'    >> vpn.ovpn
-          printf 'hand-window 130\n'                      >> vpn.ovpn
-          printf 'tls-timeout 130\n'                      >> vpn.ovpn
-          printf 'server-poll-timeout 20\n'               >> vpn.ovpn
-          printf 'connect-retry 2 5\n'                    >> vpn.ovpn
-          printf 'resolv-retry infinite\n'                >> vpn.ovpn
-          printf 'explicit-exit-notify 1\n'               >> vpn.ovpn
-          printf 'fast-io\n'                              >> vpn.ovpn
-          printf 'sndbuf 524288\n'                        >> vpn.ovpn
-          printf 'rcvbuf 524288\n'                        >> vpn.ovpn
+          printf '\nauth-user-pass %s/pass.txt\n' "$WD" >> vpn.ovpn
+          printf 'auth-nocache\n'                        >> vpn.ovpn
+          printf 'data-ciphers AES-128-CBC\n'            >> vpn.ovpn
+          printf 'data-ciphers-fallback AES-128-CBC\n'   >> vpn.ovpn
+          printf 'hand-window 130\n'                     >> vpn.ovpn
+          printf 'tls-timeout 130\n'                     >> vpn.ovpn
+          printf 'server-poll-timeout 20\n'              >> vpn.ovpn
+          printf 'connect-retry 2 5\n'                   >> vpn.ovpn
+          printf 'resolv-retry infinite\n'               >> vpn.ovpn
+          printf 'fast-io\n'                             >> vpn.ovpn
+          printf 'sndbuf 524288\n'                       >> vpn.ovpn
+          printf 'rcvbuf 524288\n'                       >> vpn.ovpn
 
           echo "--- vpn.ovpn ($(wc -l < vpn.ovpn) lines) ---"
           grep -E '^(remote|proto|hand-window|server-poll-timeout)' vpn.ovpn
@@ -90,27 +88,27 @@ jobs:
           echo "ORIG_IF=$IF" >> "$GITHUB_ENV"
           echo "runner IP: $(curl -s --max-time 6 https://api.ipify.org) | gw=$GW dev=$IF"
 
-          # write start_cf.sh using printf to avoid indentation issues
-          printf '%s\n' '#!/usr/bin/env bash' > "$WD/start_cf.sh"
-          printf '%s\n' 'set -u' >> "$WD/start_cf.sh"
-          printf '%s\n' 'WD="${WD:-$PWD}"' >> "$WD/start_cf.sh"
-          printf '%s\n' 'RAW="${CF_TUNNEL_TOKEN:-}"' >> "$WD/start_cf.sh"
-          printf '%s\n' 'CLEAN=$(printf "%s" "$RAW" | tr -d '"'"'[:space:]"'"'"')' >> "$WD/start_cf.sh"
-          printf '%s\n' 'case "$CLEAN" in *eyJ*) TOKEN="eyJ${CLEAN#*eyJ}" ;; *) TOKEN="$CLEAN" ;; esac' >> "$WD/start_cf.sh"
-          printf '%s\n' '[ -n "$TOKEN" ] || { echo "empty tunnel token"; exit 1; }' >> "$WD/start_cf.sh"
-          printf '%s\n' 'sudo pkill -f "tunnel --no-autoupdate run" 2>/dev/null || true' >> "$WD/start_cf.sh"
-          printf '%s\n' 'sleep 1' >> "$WD/start_cf.sh"
-          printf '%s\n' ': > "$WD/cloudflared.log"' >> "$WD/start_cf.sh"
-          printf '%s\n' 'if [ "${CF_MODE:-plain}" = "isolated" ]; then' >> "$WD/start_cf.sh"
-          printf '%s\n' '  nohup sudo -u cfuser env HOME=/tmp TUNNEL_TOKEN="$TOKEN" TUNNEL_TRANSPORT_PROTOCOL=http2 /usr/local/bin/cfd tunnel --no-autoupdate run >> "$WD/cloudflared.log" 2>&1 &' >> "$WD/start_cf.sh"
-          printf '%s\n' 'else' >> "$WD/start_cf.sh"
-          printf '%s\n' '  nohup env TUNNEL_TOKEN="$TOKEN" TUNNEL_TRANSPORT_PROTOCOL=http2 /usr/local/bin/cfd tunnel --no-autoupdate run >> "$WD/cloudflared.log" 2>&1 &' >> "$WD/start_cf.sh"
-          printf '%s\n' 'fi' >> "$WD/start_cf.sh"
-          printf '%s\n' 'for i in $(seq 1 300); do' >> "$WD/start_cf.sh"
-          printf '%s\n' '  grep -q "Registered tunnel connection" "$WD/cloudflared.log" && { echo "tunnel up after ${i}x200ms"; exit 0; }' >> "$WD/start_cf.sh"
-          printf '%s\n' '  sleep 0.2' >> "$WD/start_cf.sh"
-          printf '%s\n' 'done' >> "$WD/start_cf.sh"
-          printf '%s\n' 'echo "tunnel failed:"; tail -n 30 "$WD/cloudflared.log"; exit 1' >> "$WD/start_cf.sh"
+          # write start_cf.sh
+          printf '%s\n' '#!/usr/bin/env bash'                                                                                                                                                                      > "$WD/start_cf.sh"
+          printf '%s\n' 'set -u'                                                                                                                                                                                   >> "$WD/start_cf.sh"
+          printf '%s\n' 'WD="${WD:-$PWD}"'                                                                                                                                                                         >> "$WD/start_cf.sh"
+          printf '%s\n' 'RAW="${CF_TUNNEL_TOKEN:-}"'                                                                                                                                                               >> "$WD/start_cf.sh"
+          printf '%s\n' 'CLEAN=$(printf "%s" "$RAW" | tr -d '"'"'[:space:]"'"'"')'                                                                                                                                 >> "$WD/start_cf.sh"
+          printf '%s\n' 'case "$CLEAN" in *eyJ*) TOKEN="eyJ${CLEAN#*eyJ}" ;; *) TOKEN="$CLEAN" ;; esac'                                                                                                           >> "$WD/start_cf.sh"
+          printf '%s\n' '[ -n "$TOKEN" ] || { echo "empty tunnel token"; exit 1; }'                                                                                                                                >> "$WD/start_cf.sh"
+          printf '%s\n' 'sudo pkill -f "tunnel --no-autoupdate run" 2>/dev/null || true'                                                                                                                           >> "$WD/start_cf.sh"
+          printf '%s\n' 'sleep 1'                                                                                                                                                                                  >> "$WD/start_cf.sh"
+          printf '%s\n' ': > "$WD/cloudflared.log"'                                                                                                                                                                >> "$WD/start_cf.sh"
+          printf '%s\n' 'if [ "${CF_MODE:-plain}" = "isolated" ]; then'                                                                                                                                            >> "$WD/start_cf.sh"
+          printf '%s\n' '  nohup sudo -u cfuser env HOME=/tmp TUNNEL_TOKEN="$TOKEN" TUNNEL_TRANSPORT_PROTOCOL=http2 /usr/local/bin/cfd tunnel --no-autoupdate run >> "$WD/cloudflared.log" 2>&1 &'                >> "$WD/start_cf.sh"
+          printf '%s\n' 'else'                                                                                                                                                                                     >> "$WD/start_cf.sh"
+          printf '%s\n' '  nohup env TUNNEL_TOKEN="$TOKEN" TUNNEL_TRANSPORT_PROTOCOL=http2 /usr/local/bin/cfd tunnel --no-autoupdate run >> "$WD/cloudflared.log" 2>&1 &'                                         >> "$WD/start_cf.sh"
+          printf '%s\n' 'fi'                                                                                                                                                                                       >> "$WD/start_cf.sh"
+          printf '%s\n' 'for i in $(seq 1 300); do'                                                                                                                                                                >> "$WD/start_cf.sh"
+          printf '%s\n' '  grep -q "Registered tunnel connection" "$WD/cloudflared.log" && { echo "tunnel up after ${i}x200ms"; exit 0; }'                                                                        >> "$WD/start_cf.sh"
+          printf '%s\n' '  sleep 0.2'                                                                                                                                                                              >> "$WD/start_cf.sh"
+          printf '%s\n' 'done'                                                                                                                                                                                     >> "$WD/start_cf.sh"
+          printf '%s\n' 'echo "tunnel failed:"; tail -n 30 "$WD/cloudflared.log"; exit 1'                                                                                                                         >> "$WD/start_cf.sh"
           chmod +x "$WD/start_cf.sh"
 
           echo "bootstrap done"
@@ -141,7 +139,7 @@ jobs:
               fi
 
               if sudo grep -qE \
-                "AUTH_FAILED|Exiting due to fatal error|Connection refused|SIGTERM|TLS Error|tls-crypt" \
+                "AUTH_FAILED|Exiting due to fatal error|Connection refused|SIGTERM|TLS Error|tls-crypt|Options error" \
                 "$WD/vpn.log" 2>/dev/null; then
                 RESULT=fail; break
               fi
