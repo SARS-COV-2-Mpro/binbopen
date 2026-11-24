@@ -1,3 +1,4 @@
+
 name: Continuous VPN Worker - Instance A
 on:
   repository_dispatch:
@@ -32,7 +33,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Job Info
         run: |
           echo "Instance:  $INSTANCE"
@@ -41,7 +41,6 @@ jobs:
           echo "Run id:    $GITHUB_RUN_ID"
           date -u
           ls -la receiver.py
-
       - name: Ensure DNS works
         run: |
           echo "---- current resolv.conf ----"
@@ -52,7 +51,6 @@ jobs:
           getent hosts security.ubuntu.com || true
           getent hosts archive.ubuntu.com  || true
           getent hosts github.com          || true
-
       - name: Download cloudflared
         run: |
           curl -fsSL -o cloudflared \
@@ -60,7 +58,6 @@ jobs:
           chmod +x cloudflared
           sudo install -m 755 cloudflared /usr/local/bin/cfd
           ./cloudflared --version
-
       - name: Validate secrets
         run: |
           missing=0
@@ -69,7 +66,6 @@ jobs:
           done
           [ "$missing" = 0 ] || exit 1
           echo "all required secrets present"
-
       - name: Create helper scripts
         run: |
           cat > "$WD/startup_fail.sh" <<'EOF'
@@ -77,7 +73,6 @@ jobs:
           echo "STARTUP FAILED: $*"
           exit 1
           EOF
-
           cat > "$WD/start_cf.sh" <<'EOF'
           #!/usr/bin/env bash
           set -u
@@ -114,10 +109,8 @@ jobs:
           tail -n 40 "$WD/cloudflared.log"
           exit 1
           EOF
-
           chmod +x "$WD/startup_fail.sh" "$WD/start_cf.sh"
-
-      - name: Install OpenVPN and tools
+      - name: Install OpenVPN
         run: |
           ok=0
           for i in 1 2 3 4 5; do
@@ -126,144 +119,51 @@ jobs:
             sleep 10
           done
           [ "$ok" = 1 ] || { echo "apt-get update failed after 5 attempts"; exit 1; }
-          sudo apt-get install -y -qq openvpn netcat-openbsd
+          sudo apt-get install -y -qq openvpn
           openvpn --version | head -n 1
-
       - name: Setup VPN credentials
         run: |
           printf '%s' "$VPN_CONFIG" > vpn.ovpn
           sed -i 's/\r$//' vpn.ovpn
-
-          # force TCP + port 443
-          sed -i 's/^proto udp.*/proto tcp/' vpn.ovpn
-          sed -i -E 's/^(remote [^ ]+) [0-9]+/\1 443/' vpn.ovpn
-
           printf '%s\n%s\n' "$VPN_USERNAME" "$VPN_PASSWORD" > pass.txt
           chmod 600 pass.txt
-
           {
             echo ""
             echo "auth-user-pass $WD/pass.txt"
-            echo "auth-nocache"
             echo "data-ciphers AES-128-CBC"
             echo "data-ciphers-fallback AES-128-CBC"
-            echo "hand-window 130"
-            echo "tls-timeout 130"
-            echo "connect-retry 5 10"
-            echo "resolv-retry infinite"
-            echo "server-poll-timeout 30"
           } >> vpn.ovpn
-
           echo "vpn.ovpn written ($(wc -l < vpn.ovpn) lines)"
-          echo "---- effective remote/proto lines ----"
-          grep -E '^(remote|proto|hand-window|tls-timeout|server-poll-timeout) ' vpn.ovpn || true
-
       - name: Check IP before VPN
         run: |
-          RUNNER_IP=$(curl -s --max-time 10 https://api.ipify.org)
-          RUNNER_ORG=$(curl -s --max-time 10 "https://ipinfo.io/$RUNNER_IP/org" || true)
-          echo "runner IP  : $RUNNER_IP"
-          echo "runner org : $RUNNER_ORG"
+          echo "runner IP before VPN: $(curl -s --max-time 10 https://api.ipify.org)"
           read -r GW IF <<< "$(ip route show default | awk '/^default/ {for(i=1;i<=NF;i++){if($i=="via")g=$(i+1); if($i=="dev")d=$(i+1)}; print g" "d; exit}')"
           echo "original gateway: $GW dev $IF"
           echo "ORIG_GW=$GW" >> "$GITHUB_ENV"
           echo "ORIG_IF=$IF" >> "$GITHUB_ENV"
-
-      - name: Pre-check VPN server reachability
-        run: |
-          VPN_HOST=$(awk '/^remote /{print $2; exit}' vpn.ovpn)
-          VPN_PORT=$(awk '/^remote /{print $3; exit}' vpn.ovpn)
-          VPN_PORT="${VPN_PORT:-443}"
-          echo "Testing TCP to $VPN_HOST:$VPN_PORT ..."
-          for i in 1 2 3; do
-            if nc -zw 10 "$VPN_HOST" "$VPN_PORT"; then
-              echo "VPN server reachable (attempt $i)"
-              break
-            fi
-            echo "attempt $i failed, waiting 20s..."
-            sleep 20
-          done
-
       - name: Start VPN
         run: |
           sudo pkill openvpn 2>/dev/null || true
-          sleep 2
           OK=0
-
-          for attempt in $(seq 1 40); do
+          for attempt in $(seq 1 80); do
             sudo sh -c ': > vpn.log'
-
-            sudo openvpn \
-              --config vpn.ovpn \
-              --verb 4 \
-              --daemon \
-              --log "$WD/vpn.log" \
-              --writepid /tmp/vpn.pid
-
+            sudo openvpn --config vpn.ovpn --daemon --log "$WD/vpn.log" --writepid /tmp/vpn.pid
             RESULT=wait
-            PUSH_COUNT=0
-
-            for s in $(seq 1 140); do
+            for s in $(seq 1 25); do
               sleep 1
-
-              if sudo grep -q "Initialization Sequence Completed" "$WD/vpn.log"; then
-                RESULT=up
-                break
-              fi
-
-              if sudo grep -qE "AUTH_FAILED|Exiting due to fatal error|Connection refused|SIGTERM|TLS Error|tls-crypt" "$WD/vpn.log"; then
-                RESULT=fail
-                break
-              fi
-
-              # detect PUSH_REQUEST loop:
-              # server authenticated us but refuses to send config (datacenter IP block)
-              PUSH_COUNT=$(sudo grep -c "PUSH_REQUEST" "$WD/vpn.log" 2>/dev/null || echo 0)
-              if [ "$PUSH_COUNT" -ge 6 ]; then
-                RESULT=push_stuck
-                break
-              fi
+              if sudo grep -q "Initialization Sequence Completed" vpn.log; then RESULT=up; break; fi
+              if sudo grep -qE "AUTH_FAILED|Exiting due to fatal error" vpn.log; then RESULT=fail; break; fi
             done
-
             if [ "$RESULT" = "up" ] && ip link show tun0 >/dev/null 2>&1; then
               OK=1
               echo "VPN up on attempt $attempt"
               break
             fi
-
-            echo ""
-            echo "======== attempt $attempt: $RESULT (push_count=$PUSH_COUNT) ========"
-            echo "--- full vpn log ---"
-            sudo cat "$WD/vpn.log" || true
-            echo "--- tun interfaces ---"
-            ip link show | grep tun || echo "no tun interface"
-            echo "=================================="
-
+            echo "attempt $attempt: $RESULT"
             sudo pkill openvpn 2>/dev/null || true
-            sleep 2
-
-            if [ "$RESULT" = "push_stuck" ]; then
-              if [ $((attempt % 5)) -eq 0 ]; then
-                echo "Server keeps ignoring PUSH_REQUEST — cooling 90s..."
-                sleep 90
-              else
-                sleep 10
-              fi
-            elif [ "$RESULT" = "wait" ]; then
-              if [ $((attempt % 5)) -eq 0 ]; then
-                echo "TLS stalling repeatedly — cooling 60s..."
-                sleep 60
-              else
-                sleep 5
-              fi
-            else
-              # hard fail (AUTH_FAILED etc) — no point retrying fast
-              sleep 10
-            fi
+            sleep 8
           done
-
-          [ "$OK" = 1 ] || bash "$WD/startup_fail.sh" "VPN did not connect after 40 attempts"
-
+          [ "$OK" = 1 ] || bash "$WD/startup_fail.sh" "VPN did not connect after 80 attempts"
       - name: Verify VPN
         run: |
           ok=0
@@ -274,7 +174,6 @@ jobs:
           done
           echo "binance ping via tun0: $ok / 30 succeeded"
           [ "$ok" -ge 20 ] || bash "$WD/startup_fail.sh" "VPN unstable ($ok/30)"
-
       - name: Exit IP gate
         run: |
           IP=$(curl -s --interface tun0 --max-time 10 https://api.ipify.org || true)
@@ -283,7 +182,6 @@ jobs:
           if [ -n "${EXPECTED_EXIT_IP:-}" ] && [ "$IP" != "$EXPECTED_EXIT_IP" ]; then
             bash "$WD/startup_fail.sh" "exit IP $IP is not the expected one"
           fi
-
       - name: Start Receiver
         run: |
           nohup python3 receiver.py > "$WD/receiver.log" 2>&1 &
@@ -295,18 +193,17 @@ jobs:
           done
           echo "receiver not ready"; tail -n 30 "$WD/receiver.log"
           exit 1
-
-      - name: Latency diagnostic
+      - name: Latency diagnostic (temporary)
         continue-on-error: true
         run: |
           echo "---- VPN protocol and server ----"
           grep -E '^(remote|proto) ' vpn.ovpn || true
-          echo "---- 4 calls direct to Binance via tun0 ----"
+          echo "---- 4 calls on ONE connection, direct to Binance via tun0 ----"
           U=https://fapi.binance.com/fapi/v1/time
-          curl -sS --interface tun0 --max-time 30 \
+          curl -sS -o /dev/null -o /dev/null -o /dev/null -o /dev/null --interface tun0 --max-time 30 \
             -w "dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
-            -o /dev/null $U $U $U $U || true
-          echo "---- 8 calls through receiver.py ----"
+            $U $U $U $U || true
+          echo "---- 8 calls through local receiver.py (pool report) ----"
           R=http://127.0.0.1:8081/fapi/v1/time
           for i in 1 2 3 4 5 6 7 8; do
             curl -sS -D /tmp/h.txt -o /dev/null --max-time 30 \
@@ -314,9 +211,8 @@ jobs:
             grep -iE '^(x-pool|x-upstream-ms)' /tmp/h.txt | tr -d '\r' | tr '\n' ' '
             echo
           done
-          echo "---- RTT via tun0 ----"
+          echo "---- RTT through the VPN ----"
           ping -c 4 -W 3 -I tun0 1.1.1.1 || true
-
       - name: Route cloudflared outside VPN
         run: |
           CF_MODE=isolated
@@ -338,11 +234,9 @@ jobs:
           else
             echo "WARNING: cloudflared will run inside the VPN path"
           fi
-
       - name: Start Cloudflare Named Tunnel
         run: |
           bash "$WD/start_cf.sh"
-
       - name: Run Task and Handoff Loop
         run: |
           set +e
@@ -354,7 +248,6 @@ jobs:
           TRIGGERED=0
           LFAILS=0
           PFAILS=0
-
           trigger_other() {
             code=$(curl -s -o /tmp/disp.txt -w '%{http_code}' -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -364,39 +257,32 @@ jobs:
             echo "trigger $OTHER_EVENT -> HTTP $code"
             [ "$code" = "204" ]
           }
-
           restart_receiver() {
             pkill -f receiver.py 2>/dev/null
             sleep 1
             nohup python3 receiver.py >> "$WD/receiver.log" 2>&1 &
             sleep 3
           }
-
           restart_tunnel() {
             echo "restarting tunnel..."
             bash "$WD/start_cf.sh"
           }
-
           fail_over() {
             echo "FAIL-OVER: $1"
             [ "$TRIGGERED" = 1 ] || trigger_other
             exit 1
           }
-
           while true; do
             NOW=$(date +%s)
             EL=$((NOW - START))
             MIN=$((EL / 60))
             [ "$EL" -ge "$DUR_S" ] && break
-
             if [ "$TRIGGERED" = 0 ] && [ "$EL" -ge "$TRIG_S" ]; then
               trigger_other && TRIGGERED=1
             fi
-
             if ! ip link show tun0 >/dev/null 2>&1; then
               fail_over "tun0 disappeared"
             fi
-
             lcode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
               http://127.0.0.1:8081/fapi/v1/ping)
             if [ "$lcode" = "200" ]; then
@@ -407,7 +293,6 @@ jobs:
               restart_receiver
               [ "$LFAILS" -ge 3 ] && fail_over "receiver not answering"
             fi
-
             if curl -s -D - -o /dev/null --max-time 15 "$URL/fapi/v1/ping" \
                  | tr -d '\r' | grep -qi '^x-via-receiver: 1'; then
               PFAILS=0
@@ -420,27 +305,23 @@ jobs:
                 PFAILS=0
               fi
             fi
-
             echo "min $MIN/$DURATION  tun0=up  local=$lcode  public=$pub  handoff_sent=$TRIGGERED"
             sleep 60
           done
-
           if [ "$TRIGGERED" = 0 ]; then
             echo "time is up and the other instance was never triggered; trying now"
             trigger_other
           fi
           echo "duration reached, exiting"
-
       - name: Debug on failure
         if: failure()
         run: |
-          echo "---- ip route ----";        ip route || true
-          echo "---- ip rule ----";         ip rule || true
-          echo "---- resolv.conf ----";     cat /etc/resolv.conf || true
-          echo "---- vpn.log (full) ----";  sudo cat vpn.log || true
+          echo "---- ip route ----";  ip route || true
+          echo "---- ip rule ----";   ip rule || true
+          echo "---- resolv.conf ----"; cat /etc/resolv.conf || true
+          echo "---- vpn.log ----";   sudo tail -n 40 vpn.log || true
           echo "---- receiver.log ----";    tail -n 40 receiver.log || true
           echo "---- cloudflared.log ----"; tail -n 40 cloudflared.log || true
-
       - name: Cleanup
         if: always()
         run: |
