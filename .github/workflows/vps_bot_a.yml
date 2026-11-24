@@ -134,8 +134,11 @@ jobs:
             exit 1
           fi
 
-          echo "---- syntax sanity check ----"
-          sudo openvpn --config "$WD/vpn.ovpn" --test-crypto
+          echo "---- NOTE: --test-crypto skipped intentionally ----"
+          echo "OpenVPN <2.7 requires --secret (static-key mode) for --test-crypto,"
+          echo "which is incompatible with this TLS/cert-based client config."
+          echo "Real syntax errors are instead caught instantly by the Start VPN"
+          echo "step's log pattern match on 'Options error' (near-zero cost)."
 
           echo "---- capturing original default route (for cloudflared bypass) ----"
           ORIG_GW=$(ip route show default | awk '{print $3; exit}')
