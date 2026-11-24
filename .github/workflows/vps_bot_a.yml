@@ -35,95 +35,85 @@ jobs:
 
       - name: Bootstrap
         run: |
-          # ── DNS ──────────────────────────────────────────────────────────
+          # DNS
           sudo sh -c 'printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf'
 
-          # ── apt (single call, no recommends) ─────────────────────────────
-          for i in 1 2 3; do sudo apt-get update -qq && break || sleep 8; done
-          sudo apt-get install -y -qq --no-install-recommends openvpn netcat-openbsd
-
-          # ── cloudflared (background while we do other things) ────────────
+          # apt + cloudflared in parallel
           curl -fsSL -o /tmp/cfd \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 &
           CFD_PID=$!
 
-          # ── validate secrets ─────────────────────────────────────────────
+          for i in 1 2 3; do sudo apt-get update -qq && break || sleep 8; done
+          sudo apt-get install -y -qq --no-install-recommends openvpn netcat-openbsd
+
+          wait $CFD_PID
+          sudo install -m 755 /tmp/cfd /usr/local/bin/cfd
+          cfd --version
+
+          # validate secrets
           missing=0
           for v in VPN_CONFIG VPN_USERNAME VPN_PASSWORD GH_TOKEN CF_TUNNEL_TOKEN; do
             [ -n "${!v}" ] || { echo "MISSING: $v"; missing=1; }
           done
           [ "$missing" = 0 ] || exit 1
 
-          # ── write vpn config ─────────────────────────────────────────────
+          # write vpn config — no indentation inside heredoc
           printf '%s' "$VPN_CONFIG" > vpn.ovpn
           sed -i 's/\r$//' vpn.ovpn
-          sed -i 's/^proto udp.*/proto tcp/'          vpn.ovpn
+          sed -i 's/^proto udp.*/proto tcp/' vpn.ovpn
           sed -i -E 's/^(remote [^ ]+) [0-9]+/\1 443/' vpn.ovpn
+
           printf '%s\n%s\n' "$VPN_USERNAME" "$VPN_PASSWORD" > pass.txt
           chmod 600 pass.txt
-          cat >> vpn.ovpn <<EOF
 
-          auth-user-pass $WD/pass.txt
-          auth-nocache
-          data-ciphers AES-128-CBC
-          data-ciphers-fallback AES-128-CBC
-          hand-window 130
-          tls-timeout 130
-          server-poll-timeout 20
-          connect-retry 2 5
-          resolv-retry infinite
-          explicit-exit-notify 1
-          fast-io
-          sndbuf 524288
-          rcvbuf 524288
-          EOF
+          # append extra options — using printf to avoid heredoc indent issues
+          printf '\nauth-user-pass %s/pass.txt\n' "$WD"  >> vpn.ovpn
+          printf 'auth-nocache\n'                         >> vpn.ovpn
+          printf 'data-ciphers AES-128-CBC\n'             >> vpn.ovpn
+          printf 'data-ciphers-fallback AES-128-CBC\n'    >> vpn.ovpn
+          printf 'hand-window 130\n'                      >> vpn.ovpn
+          printf 'tls-timeout 130\n'                      >> vpn.ovpn
+          printf 'server-poll-timeout 20\n'               >> vpn.ovpn
+          printf 'connect-retry 2 5\n'                    >> vpn.ovpn
+          printf 'resolv-retry infinite\n'                >> vpn.ovpn
+          printf 'explicit-exit-notify 1\n'               >> vpn.ovpn
+          printf 'fast-io\n'                              >> vpn.ovpn
+          printf 'sndbuf 524288\n'                        >> vpn.ovpn
+          printf 'rcvbuf 524288\n'                        >> vpn.ovpn
 
-          # ── save original gateway ─────────────────────────────────────────
+          echo "--- vpn.ovpn ($(wc -l < vpn.ovpn) lines) ---"
+          grep -E '^(remote|proto|hand-window|server-poll-timeout)' vpn.ovpn
+
+          # save original gateway
           read -r GW IF <<< "$(ip route show default | awk '/^default/{for(i=1;i<=NF;i++){if($i=="via")g=$(i+1);if($i=="dev")d=$(i+1)};print g" "d;exit}')"
           echo "ORIG_GW=$GW" >> "$GITHUB_ENV"
           echo "ORIG_IF=$IF" >> "$GITHUB_ENV"
           echo "runner IP: $(curl -s --max-time 6 https://api.ipify.org) | gw=$GW dev=$IF"
 
-          # ── finish cloudflared install ────────────────────────────────────
-          wait $CFD_PID
-          sudo install -m 755 /tmp/cfd /usr/local/bin/cfd
-          cfd --version
-
-          # ── helper scripts ────────────────────────────────────────────────
-          cat > "$WD/start_cf.sh" <<'CFEOF'
-          #!/usr/bin/env bash
-          set -u
-          WD="${WD:-$PWD}"
-          RAW="${CF_TUNNEL_TOKEN:-}"
-          CLEAN=$(printf '%s' "$RAW" | tr -d '[:space:]"')
-          case "$CLEAN" in *eyJ*) TOKEN="eyJ${CLEAN#*eyJ}" ;; *) TOKEN="$CLEAN" ;; esac
-          [ -n "$TOKEN" ] || { echo "empty tunnel token"; exit 1; }
-          sudo pkill -f 'tunnel --no-autoupdate run' 2>/dev/null || true
-          sleep 1
-          : > "$WD/cloudflared.log"
-          if [ "${CF_MODE:-plain}" = "isolated" ]; then
-            nohup sudo -u cfuser env HOME=/tmp TUNNEL_TOKEN="$TOKEN" \
-              TUNNEL_TRANSPORT_PROTOCOL=http2 \
-              /usr/local/bin/cfd tunnel --no-autoupdate run \
-              >> "$WD/cloudflared.log" 2>&1 &
-          else
-            nohup env TUNNEL_TOKEN="$TOKEN" TUNNEL_TRANSPORT_PROTOCOL=http2 \
-              /usr/local/bin/cfd tunnel --no-autoupdate run \
-              >> "$WD/cloudflared.log" 2>&1 &
-          fi
-          # poll every 200ms
-          for i in $(seq 1 300); do
-            grep -q "Registered tunnel connection" "$WD/cloudflared.log" && \
-              { echo "tunnel up in $((i*2/10)).$((i*2%10))s"; exit 0; }
-            sleep 0.2
-          done
-          echo "tunnel failed after 60s:"; tail -n 30 "$WD/cloudflared.log"; exit 1
-          CFEOF
+          # write start_cf.sh using printf to avoid indentation issues
+          printf '%s\n' '#!/usr/bin/env bash' > "$WD/start_cf.sh"
+          printf '%s\n' 'set -u' >> "$WD/start_cf.sh"
+          printf '%s\n' 'WD="${WD:-$PWD}"' >> "$WD/start_cf.sh"
+          printf '%s\n' 'RAW="${CF_TUNNEL_TOKEN:-}"' >> "$WD/start_cf.sh"
+          printf '%s\n' 'CLEAN=$(printf "%s" "$RAW" | tr -d '"'"'[:space:]"'"'"')' >> "$WD/start_cf.sh"
+          printf '%s\n' 'case "$CLEAN" in *eyJ*) TOKEN="eyJ${CLEAN#*eyJ}" ;; *) TOKEN="$CLEAN" ;; esac' >> "$WD/start_cf.sh"
+          printf '%s\n' '[ -n "$TOKEN" ] || { echo "empty tunnel token"; exit 1; }' >> "$WD/start_cf.sh"
+          printf '%s\n' 'sudo pkill -f "tunnel --no-autoupdate run" 2>/dev/null || true' >> "$WD/start_cf.sh"
+          printf '%s\n' 'sleep 1' >> "$WD/start_cf.sh"
+          printf '%s\n' ': > "$WD/cloudflared.log"' >> "$WD/start_cf.sh"
+          printf '%s\n' 'if [ "${CF_MODE:-plain}" = "isolated" ]; then' >> "$WD/start_cf.sh"
+          printf '%s\n' '  nohup sudo -u cfuser env HOME=/tmp TUNNEL_TOKEN="$TOKEN" TUNNEL_TRANSPORT_PROTOCOL=http2 /usr/local/bin/cfd tunnel --no-autoupdate run >> "$WD/cloudflared.log" 2>&1 &' >> "$WD/start_cf.sh"
+          printf '%s\n' 'else' >> "$WD/start_cf.sh"
+          printf '%s\n' '  nohup env TUNNEL_TOKEN="$TOKEN" TUNNEL_TRANSPORT_PROTOCOL=http2 /usr/local/bin/cfd tunnel --no-autoupdate run >> "$WD/cloudflared.log" 2>&1 &' >> "$WD/start_cf.sh"
+          printf '%s\n' 'fi' >> "$WD/start_cf.sh"
+          printf '%s\n' 'for i in $(seq 1 300); do' >> "$WD/start_cf.sh"
+          printf '%s\n' '  grep -q "Registered tunnel connection" "$WD/cloudflared.log" && { echo "tunnel up after ${i}x200ms"; exit 0; }' >> "$WD/start_cf.sh"
+          printf '%s\n' '  sleep 0.2' >> "$WD/start_cf.sh"
+          printf '%s\n' 'done' >> "$WD/start_cf.sh"
+          printf '%s\n' 'echo "tunnel failed:"; tail -n 30 "$WD/cloudflared.log"; exit 1' >> "$WD/start_cf.sh"
           chmod +x "$WD/start_cf.sh"
 
-          echo "---- bootstrap done ----"
-          echo "vpn.ovpn: $(wc -l < vpn.ovpn) lines"
-          grep -E '^(remote|proto) ' vpn.ovpn
+          echo "bootstrap done"
 
       - name: Start VPN
         run: |
@@ -143,7 +133,6 @@ jobs:
             RESULT=wait
             PUSH_COUNT=0
 
-            # poll every 200ms — 140s max = 700 iterations
             for tick in $(seq 1 700); do
               sleep 0.2
 
@@ -157,7 +146,6 @@ jobs:
                 RESULT=fail; break
               fi
 
-              # push_stuck: authenticated but server ignores us
               if [ $((tick % 5)) -eq 0 ]; then
                 PUSH_COUNT=$(sudo grep -c "PUSH_REQUEST" "$WD/vpn.log" 2>/dev/null || echo 0)
                 [ "$PUSH_COUNT" -ge 5 ] && { RESULT=push_stuck; break; }
@@ -166,7 +154,7 @@ jobs:
 
             if [ "$RESULT" = "up" ] && ip link show tun0 >/dev/null 2>&1; then
               OK=1
-              echo "VPN up on attempt $attempt (${tick} ticks)"
+              echo "VPN up on attempt $attempt"
               break
             fi
 
@@ -179,8 +167,8 @@ jobs:
             sleep 2
 
             case "$RESULT" in
-              push_stuck) [ $((attempt % 5)) -eq 0 ] && sleep 90 || sleep 8  ;;
-              wait)        [ $((attempt % 5)) -eq 0 ] && sleep 60 || sleep 4  ;;
+              push_stuck) [ $((attempt % 5)) -eq 0 ] && sleep 90 || sleep 8 ;;
+              wait)        [ $((attempt % 5)) -eq 0 ] && sleep 60 || sleep 4 ;;
               *)           sleep 8 ;;
             esac
           done
@@ -189,7 +177,7 @@ jobs:
 
       - name: Verify VPN + Start services
         run: |
-          # ── VPN health check ─────────────────────────────────────────────
+          # VPN health check
           ok=0
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -200,7 +188,7 @@ jobs:
           echo "binance via tun0: $ok/30"
           [ "$ok" -ge 20 ] || { echo "STARTUP FAILED: VPN unstable ($ok/30)"; exit 1; }
 
-          # ── exit IP gate ─────────────────────────────────────────────────
+          # exit IP gate
           IP=$(curl -s --interface tun0 --max-time 8 https://api.ipify.org || true)
           echo "VPN exit IP: $IP"
           [ -n "$IP" ] || { echo "STARTUP FAILED: could not read exit IP"; exit 1; }
@@ -208,17 +196,17 @@ jobs:
             echo "STARTUP FAILED: exit IP $IP != expected $EXPECTED_EXIT_IP"; exit 1
           fi
 
-          # ── receiver (background) ────────────────────────────────────────
+          # receiver
           nohup python3 receiver.py > "$WD/receiver.log" 2>&1 &
-          for i in $(seq 1 40); do
+          for i in $(seq 1 60); do
             sleep 0.3
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
               http://127.0.0.1:8081/fapi/v1/ping || true)
-            [ "$code" = "200" ] && { echo "receiver up after $((i*3/10))s"; break; }
+            [ "$code" = "200" ] && { echo "receiver up after ~$((i*3/10))s"; break; }
           done
           [ "$code" = "200" ] || { echo "receiver not ready"; tail -n 30 "$WD/receiver.log"; exit 1; }
 
-          # ── cloudflared routing ──────────────────────────────────────────
+          # cloudflared routing
           CF_MODE=isolated
           if ! id cfuser >/dev/null 2>&1; then
             sudo useradd -r -s /usr/sbin/nologin cfuser || CF_MODE=plain
@@ -226,14 +214,13 @@ jobs:
           if [ "$CF_MODE" = "isolated" ] && [ -n "${ORIG_GW:-}" ] && [ -n "${ORIG_IF:-}" ]; then
             CFUID=$(id -u cfuser)
             sudo ip route replace default via "$ORIG_GW" dev "$ORIG_IF" onlink table 100 || CF_MODE=plain
-            sudo ip rule add uidrange "$CFUID-$CFUID" lookup 100 priority 100          || CF_MODE=plain
+            sudo ip rule add uidrange "$CFUID-$CFUID" lookup 100 priority 100           || CF_MODE=plain
           else
             CF_MODE=plain
           fi
           echo "CF_MODE=$CF_MODE" >> "$GITHUB_ENV"
           echo "cloudflared mode: $CF_MODE"
 
-          # ── start cloudflared ────────────────────────────────────────────
           bash "$WD/start_cf.sh"
 
       - name: Run Task and Handoff Loop
@@ -242,8 +229,8 @@ jobs:
           URL="${PUBLIC_URL:-https://fapi.astiagbiance.dpdns.org}"
           URL="${URL%/}"
           START=$(date +%s)
-          DUR_S=$((DURATION  * 60))
-          TRIG_S=$((TRIGGER  * 60))
+          DUR_S=$((DURATION * 60))
+          TRIG_S=$((TRIGGER * 60))
           TRIGGERED=0
           LFAILS=0
           PFAILS=0
@@ -278,7 +265,6 @@ jobs:
 
             ip link show tun0 >/dev/null 2>&1 || fail_over "tun0 disappeared"
 
-            # local probe
             lcode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 \
               http://127.0.0.1:8081/fapi/v1/ping)
             if [ "$lcode" = "200" ]; then
@@ -290,15 +276,12 @@ jobs:
               [ "$LFAILS" -ge 3 ] && fail_over "receiver not answering"
             fi
 
-            # public probe
             if curl -s -D - -o /dev/null --max-time 10 "$URL/fapi/v1/ping" \
                 | tr -d '\r' | grep -qi '^x-via-receiver: 1'; then
               PFAILS=0; pub=ok
             else
               PFAILS=$((PFAILS+1)); pub="FAIL($PFAILS)"
-              if [ "$PFAILS" -ge 3 ]; then
-                bash "$WD/start_cf.sh"; PFAILS=0
-              fi
+              [ "$PFAILS" -ge 3 ] && { bash "$WD/start_cf.sh"; PFAILS=0; }
             fi
 
             echo "min $MIN/$DURATION tun0=up local=$lcode public=$pub triggered=$TRIGGERED"
@@ -311,10 +294,10 @@ jobs:
       - name: Debug on failure
         if: failure()
         run: |
-          echo "=== ip route ===";        ip route          || true
-          echo "=== ip rule ===";         ip rule           || true
+          echo "=== ip route ===";        ip route             || true
+          echo "=== ip rule ===";         ip rule              || true
           echo "=== resolv.conf ===";     cat /etc/resolv.conf || true
-          echo "=== vpn.log ===";         sudo cat vpn.log  || true
+          echo "=== vpn.log ===";         sudo cat vpn.log     || true
           echo "=== receiver.log ===";    tail -n 40 receiver.log    || true
           echo "=== cloudflared.log ==="; tail -n 40 cloudflared.log || true
 
@@ -322,7 +305,7 @@ jobs:
         if: always()
         run: |
           sudo pkill -f 'tunnel --no-autoupdate run' 2>/dev/null || true
-          pkill -f receiver.py        2>/dev/null || true
+          pkill -f receiver.py             2>/dev/null || true
           sudo ip rule  del priority 100   2>/dev/null || true
           sudo ip route flush table 100    2>/dev/null || true
           sudo pkill openvpn               2>/dev/null || true
