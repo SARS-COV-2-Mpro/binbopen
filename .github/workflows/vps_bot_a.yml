@@ -67,21 +67,35 @@ jobs:
           printf '%s' "$VPN_CONFIG" > vpn.ovpn
           sed -i 's/\r$//' vpn.ovpn
 
-          # Force TCP + port 443 (bypasses UDP/port blocking on datacenter IPs)
-          sed -i 's/^proto udp.*/proto tcp/' vpn.ovpn
-          sed -i -E 's/^(remote [^ ]+) [0-9]+/\1 443/' vpn.ovpn
+          # REAL FIX: force TCP + port 443 on every remote line AND every
+          # standalone proto line, including the embedded proto field on
+          # "remote HOST PORT proto" lines. A plain sed on the port number
+          # alone left the trailing "udp" word untouched, so OpenVPN kept
+          # silently connecting over UDP no matter what we did.
+          awk '
+            {
+              if ($1 == "remote") {
+                if (NF >= 3) $3 = "443"
+                if (NF >= 4) $4 = "tcp"
+                print
+                next
+              }
+              if ($1 == "proto") { print "proto tcp"; next }
+              print
+            }
+          ' vpn.ovpn > vpn.ovpn.tmp && mv vpn.ovpn.tmp vpn.ovpn
 
-          # strip any directive that is UDP-only or that we are about to redefine,
-          # so we never end up with duplicate/conflicting options
+          # belt-and-suspenders: if no "proto" line exists at all, add one
+          grep -q '^proto ' vpn.ovpn || sed -i '1i proto tcp' vpn.ovpn
+
+          # strip directives we are about to redefine or that are UDP-only
           sed -i -E '/^explicit-exit-notify/d;/^auth-user-pass/d;/^auth-nocache/d' vpn.ovpn
           sed -i -E '/^data-ciphers(-fallback)?\b/d' vpn.ovpn
-          sed -i -E '/^(hand-window|tls-timeout|server-poll-timeout|connect-retry|resolv-retry|fast-io|sndbuf|rcvbuf)\b/d' vpn.ovpn
+          sed -i -E '/^(hand-window|tls-timeout|server-poll-timeout|connect-retry|resolv-retry|fast-io|sndbuf|rcvbuf|mssfix|tun-mtu)\b/d' vpn.ovpn
 
           printf '%s\n%s\n' "$VPN_USERNAME" "$VPN_PASSWORD" > pass.txt
           chmod 600 pass.txt
 
-          # Append tuned options. (heredoc content has no leading spaces,
-          # and OpenVPN trims whitespace on each config line anyway.)
           cat >> vpn.ovpn <<CFG
           auth-user-pass $WD/pass.txt
           auth-nocache
@@ -95,12 +109,20 @@ jobs:
           fast-io
           sndbuf 524288
           rcvbuf 524288
+          mssfix 1400
+          tun-mtu 1400
           CFG
 
-          echo "---- vpn.ovpn summary ($(wc -l < vpn.ovpn) lines) ----"
-          grep -E '^(remote|proto|hand-window|server-poll-timeout)\b' vpn.ovpn
+          echo "---- FINAL proto/remote lines (must show tcp everywhere) ----"
+          grep -E '^(remote|proto)\b' vpn.ovpn
 
-          # ---- quick syntax sanity check (fails fast, no 140s wait) --------
+          # Hard safety gate: refuse to even try if any UDP profile survived
+          if grep -E '^(remote|proto)\b' vpn.ovpn | grep -qi udp; then
+            echo "FATAL: config still contains a UDP profile — aborting before wasting attempts"
+            exit 1
+          fi
+
+          # Fast syntax/crypto sanity check (fails in ~1s instead of 140s)
           if ! openvpn --config vpn.ovpn --test-crypto 2>/tmp/ovpn_test.log; then
             if grep -qiE 'error|cannot|unrecognized|unknown option' /tmp/ovpn_test.log; then
               echo "vpn.ovpn has a fatal config error:"
@@ -194,8 +216,14 @@ jobs:
               fi
 
               if [ $((tick % 5)) -eq 0 ]; then
-                PUSH_COUNT=$(sudo grep -c "PUSH_REQUEST" "$WD/vpn.log" 2>/dev/null || echo 0)
-                [ "$PUSH_COUNT" -ge 5 ] && { RESULT=push_stuck; break; }
+                # FIXED: grep -c prints "0" but exits status 1 on zero matches.
+                # The old "|| echo 0" ran in ADDITION, producing a 2-line
+                # value that broke the [ -ge ] integer test. Use parameter
+                # expansion + a digit-only guard instead.
+                PUSH_COUNT=$(sudo grep -c "PUSH_REQUEST" "$WD/vpn.log" 2>/dev/null)
+                PUSH_COUNT=${PUSH_COUNT:-0}
+                case "$PUSH_COUNT" in ''|*[!0-9]*) PUSH_COUNT=0 ;; esac
+                [ "$PUSH_COUNT" -ge 5 ] 2>/dev/null && { RESULT=push_stuck; break; }
               fi
             done
 
@@ -207,7 +235,7 @@ jobs:
 
             echo ""
             echo "==== attempt $attempt: $RESULT (push_count=$PUSH_COUNT) ===="
-            sudo cat "$WD/vpn.log" || true
+            sudo tail -n 60 "$WD/vpn.log" || true
             echo "=============================================================="
 
             sudo pkill openvpn 2>/dev/null || true
